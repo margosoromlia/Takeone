@@ -1,0 +1,88 @@
+# Собирает установщик для Windows и .dmg для macOS (Apple Silicon и Intel).
+# Запуск: вкладка Actions → Build → Run workflow, либо пуш тега вида v1.0.0
+# (тогда файлы ещё и прикрепятся к релизу на странице Releases).
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+
+      - name: Build UxPlay (AirPlay receiver)
+        shell: msys2 {0}
+        run: bash packaging/bundle_uxplay.sh "$(cygpath -u "$GITHUB_WORKSPACE")/build-uxplay"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: ./packaging/build_windows.ps1 -UxplayDir "$env:GITHUB_WORKSPACE\build-uxplay"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Takeone-Windows
+          path: build/installer/*.exe
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15        # Apple Silicon
+            arch: arm64
+          - runner: macos-15-intel  # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build app and DMG
+        run: bash packaging/build_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Takeone-macOS-${{ matrix.arch }}
+          path: build/*.dmg
+          if-no-files-found: error
+
+  release:
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: false
