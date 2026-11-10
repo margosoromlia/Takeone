@@ -8,6 +8,7 @@ iOS:     только macOS, через нативный AVFoundation (Swift-х�
          собирается автоматически при первом запуске).
 """
 import datetime
+import json
 import os
 import queue
 import re
@@ -22,7 +23,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP = "Takeone"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +145,26 @@ def find_scrcpy_server():
         if c and os.path.exists(c):
             return os.path.abspath(c), ver
     return None, ver
+
+
+WIN_SIZES = {"Маленький": 0.55, "Средний": 0.7, "Большой": 0.86}
+SETTINGS = os.path.join(DATA_DIR, "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(cfg):
+    try:
+        with open(SETTINGS, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
 
 
 def default_shots_dir():
@@ -528,7 +549,6 @@ class App:
         root.title(f"{APP} {VERSION}")
         root.resizable(False, False)
         self.engine = None
-        self.android_win = None
         self.state = "idle"  # idle | connected | recording | paused
         self.busy = False
         self.devices = []
@@ -536,12 +556,18 @@ class App:
         self.seg_started = None
         self.close_after_save = False
 
-        self.platform = tk.StringVar(value="Android")
+        cfg = load_settings()
+        self.platform = tk.StringVar(value=cfg.get("platform", "Android"))
+        if self.platform.get() == "iOS" and not IS_MAC:
+            self.platform.set("Android")
         self.device = tk.StringVar()
-        self.max_size = tk.StringVar(value="1920")
-        self.bitrate = tk.StringVar(value="8")
-        self.audio = tk.BooleanVar(value=True)
-        self.ap_name = tk.StringVar(value="Takeone")
+        self.max_size = tk.StringVar(value=cfg.get("max_size", "1920"))
+        self.bitrate = tk.StringVar(value=cfg.get("bitrate", "8"))
+        self.audio = tk.BooleanVar(value=cfg.get("audio", True))
+        self.ap_name = tk.StringVar(value=cfg.get("ap_name", "Takeone"))
+        self.limit_mb = tk.StringVar(value=cfg.get("limit_mb", "50"))
+        self.win_size = tk.StringVar(value=cfg.get("win_size", "Большой"))
+        self.android_wins = []
         self.ap_hint = None
         self.status = tk.StringVar(value="Подключите устройство по USB и нажмите «Обновить».")
         self.timer = tk.StringVar(value="00:00:00")
@@ -565,6 +591,9 @@ class App:
         ttk.Label(f, text="Устройство:").grid(row=1, column=0, sticky="w", pady=6)
         self.dev_cb = ttk.Combobox(f, textvariable=self.device, state="readonly", width=42)
         self.dev_cb.grid(row=1, column=1, sticky="we", pady=6)
+        self.dev_list = tk.Listbox(f, selectmode="multiple", height=3, exportselection=False,
+                                   activestyle="none", width=44)
+        self.dev_list.grid(row=1, column=1, sticky="we", pady=6)
         self.btn_refresh = ttk.Button(f, text="Обновить", command=self.refresh)
         self.btn_refresh.grid(row=1, column=2, padx=(6, 0))
 
@@ -576,6 +605,9 @@ class App:
         ttk.Entry(self.opts, textvariable=self.bitrate, width=8).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Checkbutton(self.opts, text="Записывать звук устройства (Android 11+)",
                         variable=self.audio).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(self.opts, text="Размер окна телефона:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(self.opts, textvariable=self.win_size, state="readonly", width=12,
+                     values=list(WIN_SIZES)).grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
 
         self.ap_opts = ttk.LabelFrame(f, text="Настройки AirPlay", padding=8)
         self.ap_opts.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 8))
@@ -586,8 +618,15 @@ class App:
                        "Пункт управления → Повтор экрана → выберите это имя.").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
+        lf = ttk.Frame(f)
+        lf.grid(row=3, column=0, columnspan=3, sticky="we", pady=(0, 8))
+        ttk.Label(lf, text="Видео не больше").pack(side="left")
+        ttk.Entry(lf, textvariable=self.limit_mb, width=6).pack(side="left", padx=6)
+        ttk.Label(lf, text="МБ  (0 — без лимита; если больше — сожмётся при сохранении)",
+                  foreground="#666").pack(side="left")
+
         bf = ttk.Frame(f)
-        bf.grid(row=3, column=0, columnspan=3, sticky="we")
+        bf.grid(row=4, column=0, columnspan=3, sticky="we")
         self.btn_conn = ttk.Button(bf, text="Подключить", command=self.toggle_connect, width=13)
         self.btn_rec = ttk.Button(bf, text="● Запись", command=self.start_rec, width=11)
         self.btn_pause = ttk.Button(bf, text="⏸ Пауза", command=self.toggle_pause, width=14)
@@ -596,14 +635,14 @@ class App:
             b.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
 
         self.timer_row = tf = ttk.Frame(f)
-        tf.grid(row=4, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        tf.grid(row=5, column=0, columnspan=3, sticky="we", pady=(10, 0))
         self.dot = tk.Label(tf, text="●", fg="gray", font=("TkDefaultFont", 16))
         self.dot.pack(side="left")
         ttk.Label(tf, textvariable=self.timer, font=("TkFixedFont", 20)).pack(side="left", padx=6)
         ttk.Label(f, textvariable=self.status, wraplength=470, foreground="#555").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.hint = ttk.Label(f, text="", foreground="#888", wraplength=470)
-        self.hint.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.hint.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         root.bind("<Control-r>", lambda e: self.start_rec())
         root.bind("<Control-p>", lambda e: self.toggle_pause())
@@ -649,6 +688,9 @@ class App:
         self.dev_cb.configure(state="readonly" if (not b and s == "idle") else "disabled")
         plat = self.platform.get()
         android = plat == "Android"
+        (self.dev_list.grid if android else self.dev_list.grid_remove)()
+        (self.dev_cb.grid_remove if android else self.dev_cb.grid)()
+        self.dev_list.configure(state="normal" if (not b and s == "idle") else "disabled")
         en(self.btn_conn, not b and s in ("idle", "connected"))
         self.btn_conn.configure(text="Открыть трансляцию" if android else
                                 ("Отключить" if s != "idle" else "Подключить"),
@@ -656,7 +698,9 @@ class App:
         for w in (self.btn_rec, self.btn_pause, self.btn_stop):
             (w.grid_remove if android else w.grid)()
         (self.timer_row.grid_remove if android else self.timer_row.grid)()
-        self.hint.configure(text="Запись, пауза, звук и скриншоты — на панели вверху окна телефона."
+        self.hint.configure(text="Отметьте один или несколько телефонов. Несколько откроются рядом, и запись "
+                                 "на любом из них пишет все экраны в одно видео (без звука). "
+                                 "Запись, пауза, звук и скриншоты — на панели вверху окна телефона."
                             if android else
                             "Горячие клавиши (в этом окне): Ctrl+R — запись, Ctrl+P — пауза, Ctrl+S — стоп")
         en(self.btn_rec, not b and s in ("idle", "connected") and bool(self.devices))
@@ -685,6 +729,12 @@ class App:
         def done(devs):
             self.devices = devs
             self.dev_cb["values"] = [d[1] for d in devs]
+            self.dev_list.configure(state="normal")  # в заблокированный список Tk не вставляет
+            self.dev_list.delete(0, "end")
+            for d in devs:
+                self.dev_list.insert("end", d[1])
+            if devs:
+                self.dev_list.selection_set(0)
             if devs and plat == "AirPlay":
                 self.dev_cb.current(0)
                 self.status.set("Нажмите «Подключить», затем на iPhone включите «Повтор экрана».")
@@ -700,6 +750,8 @@ class App:
         def fail():
             self.devices = []
             self.dev_cb["values"] = []
+            self.dev_list.configure(state="normal")  # в заблокированный список Tk не вставляет
+            self.dev_list.delete(0, "end")
             self.device.set("")
 
         self.bg(fn, done, fail, text)
@@ -716,15 +768,31 @@ class App:
             return AirPlayEngine(self.ap_name.get())
         raise RuntimeError("Android открывается в своём окне трансляции.")
 
-    # --- Android: отдельное окно трансляции с панелью записи
+    # --- Android: окна трансляции с панелью записи (одно или несколько связанных)
+    def limit(self):
+        try:
+            return max(0.0, float(self.limit_mb.get().replace(",", ".") or 0))
+        except ValueError:
+            return 0.0
+
+    def save_settings(self):
+        save_settings({"platform": self.platform.get(), "max_size": self.max_size.get(),
+                       "bitrate": self.bitrate.get(), "audio": self.audio.get(),
+                       "ap_name": self.ap_name.get(), "limit_mb": self.limit_mb.get(),
+                       "win_size": self.win_size.get()})
+
     def open_android(self):
-        if self.busy or self.android_win is not None:
+        if self.busy or self.android_wins:
             return
-        idx = self.dev_cb.current()
-        if idx < 0:
-            messagebox.showwarning(APP, "Выберите устройство.")
+        idxs = list(self.dev_list.curselection())
+        if not idxs:
+            messagebox.showwarning(APP, "Отметьте телефон в списке.")
             return
-        serial = self.devices[idx][0]
+        serials = [self.devices[i][0] for i in idxs if self.devices[i][1].find("—") < 0]
+        if len(serials) < len(idxs):
+            messagebox.showwarning(APP, "Один из телефонов не готов (не разрешена отладка по USB). "
+                                        "Подтвердите доступ на телефоне и нажмите «Обновить».")
+            return
         try:
             ms = int(self.max_size.get() or 0)
             br = max(1.0, float(self.bitrate.get() or 8))
@@ -744,20 +812,36 @@ class App:
             messagebox.showerror(APP, f"Не хватает компонента для трансляции: {e}\n"
                                       "Установите: pip install av pillow numpy sounddevice")
             return
-        link = android_view.AndroidLink(tool("adb"), serial, server, ver, ms, br, self.audio.get(), LOG_DIR)
+        self.save_settings()
+        links = [android_view.AndroidLink(tool("adb"), s, server, ver, ms, br, self.audio.get(), LOG_DIR)
+                 for s in serials]
+
+        def start_all():
+            for ln in links:
+                ln.start()
+
+        def stop_all():
+            for ln in links:
+                ln.stop()
 
         def done(_):
-            self.android_win = android_view.DeviceWindow(
-                self.root, link, tool("ffmpeg"), default_shots_dir(), default_video_dir(), None,
-                self._android_closed, APP)
+            group = android_view.RecordGroup(tool("ffmpeg"), default_video_dir(), None, self.limit(), APP)
+            frac = WIN_SIZES.get(self.win_size.get(), 0.86)
+            for ln in links:
+                self.android_wins.append(android_view.DeviceWindow(
+                    self.root, ln, group, default_shots_dir(), self._android_closed, frac, APP))
             self.state = "connected"
             self.status.set("Трансляция открыта в отдельном окне.")
             self.root.withdraw()
 
-        self.bg(link.start, done, link.stop, "Подключаюсь к телефону…")
+        self.bg(start_all, done, stop_all,
+                "Подключаюсь к телефону…" if len(links) == 1 else f"Подключаюсь к телефонам ({len(links)})…")
 
-    def _android_closed(self):
-        self.android_win = None
+    def _android_closed(self, win):
+        if win in self.android_wins:
+            self.android_wins.remove(win)
+        if self.android_wins:
+            return
         self.state = "idle"
         self.status.set("Трансляция закрыта.")
         self.root.deiconify()
@@ -857,7 +941,25 @@ class App:
                 self.after_record("Запись удалена.")
                 return
 
-        self.bg(lambda: self.engine.save(dest), lambda path: self.after_record(f"Сохранено: {path}"),
+        eng, limit, ff = self.engine, self.limit(), tool("ffmpeg")
+
+        def save():
+            path = eng.save(dest)
+            if limit and ff and os.path.getsize(path) > limit * 1_000_000:
+                import android_view
+                tmpdir = tempfile.mkdtemp(prefix="takeone_fit_")
+                src = os.path.join(tmpdir, "orig" + os.path.splitext(path)[1])
+                shutil.move(path, src)
+                try:
+                    android_view.fit_file(ff, src, path, limit, None, tmpdir)
+                finally:
+                    if os.path.exists(path):
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+            return path
+
+        self.save_settings()
+        self.bg(save, lambda path: self.after_record(
+            f"Сохранено: {path} · {os.path.getsize(path) / 1_000_000:.1f} МБ"),
                 lambda: self.after_record(None), "Сохраняю файл…")
 
     def after_record(self, msg):
@@ -896,8 +998,9 @@ class App:
     def on_close(self):
         if self.busy:
             return
-        if self.android_win is not None:
-            self.android_win.close()
+        if self.android_wins:
+            for w in list(self.android_wins):
+                w.close()
             return
         if self.state in ("recording", "paused"):
             ans = messagebox.askyesnocancel(APP, "Идёт запись. Сохранить её перед выходом?")
@@ -915,6 +1018,10 @@ class App:
         self.shutdown()
 
     def shutdown(self):
+        try:
+            self.save_settings()
+        except Exception:  # noqa
+            pass
         if self.engine:
             try:
                 self.engine.disconnect()
