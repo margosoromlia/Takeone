@@ -56,7 +56,7 @@ echo "== PyInstaller"
   --icon "$BUILD/icon.icns" --osx-bundle-identifier app.takeone \
   --distpath "$BUILD/dist" --workpath "$BUILD/work" --specpath "$BUILD" \
   --add-data "$BIN:bin" \
-  --paths "$ROOT/app" --hidden-import android_view --collect-submodules av \
+  --paths "$ROOT/app" --hidden-import android_view --hidden-import ui_kit --collect-submodules av \
   "$ROOT/app/takeone.py"
 
 APPDIR="$BUILD/dist/Takeone.app"

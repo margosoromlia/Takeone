@@ -20,10 +20,13 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import ui_kit as ui
+from ui_kit import C
 
 APP = "Takeone"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -172,6 +175,7 @@ def default_shots_dir():
 
 
 def list_android():
+    """[(serial, название, подпись, готов ли)]"""
     adb = tool("adb")
     if not adb:
         raise RuntimeError("adb не найден. Установите scrcpy (в нём есть adb) или Android platform-tools.")
@@ -183,10 +187,30 @@ def list_android():
             continue
         serial, state = parts[0], parts[1]
         model = next((x.split(":", 1)[1] for x in parts if x.startswith("model:")), "")
-        label = f"{model.replace('_', ' ') or serial}  ({serial})"
-        if state != "device":
-            label += f"  — {state}"
-        devs.append((serial, label))
+        title = model.replace("_", " ") or serial
+        wifi = ":" in serial or serial.startswith("adb-")
+        if state == "device":
+            rel = market = ""
+            try:
+                props = run([adb, "-s", serial, "shell",
+                             "getprop ro.build.version.release; getprop ro.product.marketname; "
+                             "getprop ro.config.marketing_name"], timeout=6).stdout.splitlines()
+                props = [p.strip() for p in props] + ["", "", ""]
+                rel, market = props[0], props[1] or props[2]
+            except Exception:  # noqa — подпись не главное
+                pass
+            if market and len(market) <= 40:
+                title = market
+            sub = (f"Android {rel}" if rel else "Android") + (" · Wi-Fi" if wifi else " · USB")
+            devs.append((serial, title, sub, True))
+        else:
+            if "no permissions" in line or state == "no":
+                sub = "Нет доступа к USB-устройству (проверьте права udev)"
+            else:
+                sub = {"unauthorized": "Разрешите отладку по USB на телефоне",
+                       "offline": "Телефон не отвечает — переподключите кабель",
+                       "authorizing": "Подтвердите доступ на телефоне"}.get(state, f"Недоступен: {state}")
+            devs.append((serial, title, sub, False))
     return devs
 
 
@@ -543,15 +567,26 @@ class AirPlayEngine:
 
 
 # ----------------------------------------------------------------- GUI
+ANDROID_NOTE = "Запись, пауза, звук и скриншот — на панели в окне телефона"
+IOS_NOTE = "Ctrl+R — запись, Ctrl+P — пауза, Ctrl+S — стоп и сохранить"
+
+
 class App:
+    W = 512  # ширина содержимого главного окна
+
     def __init__(self, root):
         self.root = root
         root.title(f"{APP} {VERSION}")
         root.resizable(False, False)
+        root.configure(bg=C["bg"])
         self.engine = None
         self.state = "idle"  # idle | connected | recording | paused
         self.busy = False
-        self.devices = []
+        self.searching = False
+        self.saving = False
+        self.devices = []      # [(id, название, подпись, готов)]
+        self.selected = []     # id отмеченных устройств
+        self.rows = []
         self.elapsed = 0.0
         self.seg_started = None
         self.close_after_save = False
@@ -560,98 +595,228 @@ class App:
         self.platform = tk.StringVar(value=cfg.get("platform", "Android"))
         if self.platform.get() == "iOS" and not IS_MAC:
             self.platform.set("Android")
-        self.device = tk.StringVar()
         self.max_size = tk.StringVar(value=cfg.get("max_size", "1920"))
         self.bitrate = tk.StringVar(value=cfg.get("bitrate", "8"))
         self.audio = tk.BooleanVar(value=cfg.get("audio", True))
         self.ap_name = tk.StringVar(value=cfg.get("ap_name", "Takeone"))
         self.limit_mb = tk.StringVar(value=cfg.get("limit_mb", "50"))
-        self.win_size = tk.StringVar(value=cfg.get("win_size", "Большой"))
+        win_size = cfg.get("win_size", "Большой")
+        self.win_size = tk.StringVar(value=win_size if win_size in WIN_SIZES else "Большой")
         self.android_wins = []
         self.ap_hint = None
-        self.status = tk.StringVar(value="Подключите устройство по USB и нажмите «Обновить».")
-        self.timer = tk.StringVar(value="00:00:00")
+        self.status = tk.StringVar(value="")
 
-        f = ttk.Frame(root, padding=12)
-        f.grid(sticky="nsew")
-
-        ttk.Label(f, text="Платформа:").grid(row=0, column=0, sticky="w")
-        pf = ttk.Frame(f)
-        pf.grid(row=0, column=1, columnspan=2, sticky="w")
-        ttk.Radiobutton(pf, text="Android (USB)", value="Android", variable=self.platform,
-                        command=self.refresh).pack(side="left")
-        ios_rb = ttk.Radiobutton(pf, text="iPhone (USB, macOS)", value="iOS", variable=self.platform,
-                                 command=self.refresh)
-        ios_rb.pack(side="left", padx=(12, 0))
-        if not IS_MAC:
-            ios_rb.state(["disabled"])
-        ttk.Radiobutton(pf, text="iPhone (AirPlay, Wi-Fi)", value="AirPlay", variable=self.platform,
-                        command=self.refresh).pack(side="left", padx=(12, 0))
-
-        ttk.Label(f, text="Устройство:").grid(row=1, column=0, sticky="w", pady=6)
-        self.dev_cb = ttk.Combobox(f, textvariable=self.device, state="readonly", width=42)
-        self.dev_cb.grid(row=1, column=1, sticky="we", pady=6)
-        self.dev_list = tk.Listbox(f, selectmode="multiple", height=3, exportselection=False,
-                                   activestyle="none", width=44)
-        self.dev_list.grid(row=1, column=1, sticky="we", pady=6)
-        self.btn_refresh = ttk.Button(f, text="Обновить", command=self.refresh)
-        self.btn_refresh.grid(row=1, column=2, padx=(6, 0))
-
-        self.opts = ttk.LabelFrame(f, text="Настройки Android", padding=8)
-        self.opts.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 8))
-        ttk.Label(self.opts, text="Макс. сторона, px (0 = оригинал):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.opts, textvariable=self.max_size, width=8).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(self.opts, text="Битрейт, Мбит/с:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(self.opts, textvariable=self.bitrate, width=8).grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Checkbutton(self.opts, text="Записывать звук устройства (Android 11+)",
-                        variable=self.audio).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(self.opts, text="Размер окна телефона:").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(self.opts, textvariable=self.win_size, state="readonly", width=12,
-                     values=list(WIN_SIZES)).grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
-
-        self.ap_opts = ttk.LabelFrame(f, text="Настройки AirPlay", padding=8)
-        self.ap_opts.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 8))
-        ttk.Label(self.ap_opts, text="Имя приёмника:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.ap_opts, textvariable=self.ap_name, width=20).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(self.ap_opts, foreground="#666", wraplength=440,
-                  text="Компьютер и iPhone должны быть в одной сети Wi-Fi. После «Подключить» на iPhone: "
-                       "Пункт управления → Повтор экрана → выберите это имя.").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        lf = ttk.Frame(f)
-        lf.grid(row=3, column=0, columnspan=3, sticky="we", pady=(0, 8))
-        ttk.Label(lf, text="Видео не больше").pack(side="left")
-        ttk.Entry(lf, textvariable=self.limit_mb, width=6).pack(side="left", padx=6)
-        ttk.Label(lf, text="МБ  (0 — без лимита; если больше — сожмётся при сохранении)",
-                  foreground="#666").pack(side="left")
-
-        bf = ttk.Frame(f)
-        bf.grid(row=4, column=0, columnspan=3, sticky="we")
-        self.btn_conn = ttk.Button(bf, text="Подключить", command=self.toggle_connect, width=13)
-        self.btn_rec = ttk.Button(bf, text="● Запись", command=self.start_rec, width=11)
-        self.btn_pause = ttk.Button(bf, text="⏸ Пауза", command=self.toggle_pause, width=14)
-        self.btn_stop = ttk.Button(bf, text="■ Стоп и сохранить", command=self.stop_rec, width=18)
-        for i, b in enumerate((self.btn_conn, self.btn_rec, self.btn_pause, self.btn_stop)):
-            b.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
-
-        self.timer_row = tf = ttk.Frame(f)
-        tf.grid(row=5, column=0, columnspan=3, sticky="we", pady=(10, 0))
-        self.dot = tk.Label(tf, text="●", fg="gray", font=("TkDefaultFont", 16))
-        self.dot.pack(side="left")
-        ttk.Label(tf, textvariable=self.timer, font=("TkFixedFont", 20)).pack(side="left", padx=6)
-        ttk.Label(f, textvariable=self.status, wraplength=470, foreground="#555").grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        self.hint = ttk.Label(f, text="", foreground="#888", wraplength=470)
-        self.hint.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
+        self._build_ui()
         root.bind("<Control-r>", lambda e: self.start_rec())
         root.bind("<Control-p>", lambda e: self.toggle_pause())
         root.bind("<Control-s>", lambda e: self.stop_rec())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self._layout()
         self.update_buttons()
         self.refresh()
         self.tick()
+
+    # --- интерфейс
+    def _build_ui(self):
+        bg, W = C["bg"], self.W
+        outer = self.outer = tk.Frame(self.root, bg=bg, padx=24)
+        outer.pack(fill="both", expand=True)
+        tk.Frame(outer, bg=bg, width=W, height=0).pack()  # фиксирует ширину окна
+
+        # шапка
+        hd = tk.Frame(outer, bg=bg)
+        hd.pack(fill="x", pady=(20, 16))
+        ui.LogoTile(hd).pack(side="left")
+        tt = tk.Frame(hd, bg=bg)
+        tt.pack(side="left", padx=(12, 0))
+        ui.label(tt, APP, 17, weight="bold").pack(anchor="w")
+        ui.label(tt, "Запись экрана телефона", 12, C["muted"]).pack(anchor="w")
+        ui.label(hd, VERSION, 12, C["muted"], mono=True).pack(side="right")
+
+        # режим
+        self.tabs = ui.Segmented(outer, [("Android", "Android"), ("iOS", "iPhone · USB"),
+                                         ("AirPlay", "iPhone · Wi-Fi")], self.platform, self._platform_changed)
+        if not IS_MAC:
+            self.tabs.disable("iOS", "Запись iPhone по кабелю работает только на Mac.\n"
+                                     "На Windows используйте «iPhone · Wi-Fi».")
+        self.tabs.pack(fill="x")
+
+        # список устройств
+        self.dev_sec = sec = tk.Frame(outer, bg=bg)
+        head = tk.Frame(sec, bg=bg)
+        head.pack(fill="x")
+        self.dev_title = ui.label(head, "Телефоны", 15, weight="semibold")
+        self.dev_title.pack(side="left")
+        self.btn_refresh = ui.Button(head, "Обновить", self.refresh, kind="secondary", icon="refresh",
+                                     height=32, radius=8, size=13)
+        self.btn_refresh.pack(side="right")
+        self.dev_card = ui.Card(sec, pad=6)
+        self.dev_card.pack(fill="x", pady=(10, 0))
+        self.dev_hint = ui.label(sec, "", 12, C["text2"], wraplength=W, justify="left")
+        self.dev_hint.pack(anchor="w", pady=(10, 0))
+
+        # AirPlay: имя приёмника и шаги
+        self.ap_sec = sec = tk.Frame(outer, bg=bg)
+        ui.label(sec, "Приёмник AirPlay", 15, weight="semibold").pack(anchor="w")
+        card = ui.Card(sec, pad=16)
+        card.pack(fill="x", pady=(10, 0))
+        b = card.body
+        ui.label(b, "Имя приёмника на iPhone", 12, C["text2"]).pack(anchor="w")
+        self.f_ap = ui.Field(b, self.ap_name, width=240)
+        self.f_ap.pack(anchor="w", pady=(6, 0))
+        self.ap_steps = ui.label(b, "", 13, C["text2"], justify="left", wraplength=W - 40)
+        self.ap_steps.pack(anchor="w", pady=(14, 0))
+        self.ap_name.trace_add("write", lambda *a: self._ap_steps())
+        self._ap_steps()
+
+        # настройки
+        self.set_card = ui.Card(outer, pad=16)
+        sb = self.set_card.body
+        ui.label(sb, "Настройки", 15, weight="semibold").pack(anchor="w")
+        self.android_opts = ao = tk.Frame(sb, bg=C["panel"])
+        grid = tk.Frame(ao, bg=C["panel"])
+        grid.pack(fill="x", pady=(16, 0))
+        grid.columnconfigure(0, weight=1, uniform="c")
+        grid.columnconfigure(1, weight=1, uniform="c")
+        self.f_size = self._num_field(grid, 0, "Макс. сторона видео", self.max_size, "px", (0, 6))
+        self.f_rate = self._num_field(grid, 1, "Битрейт", self.bitrate, "Мбит/с", (6, 0))
+        ui.label(ao, "Размер окна телефона", 12, C["text2"]).pack(anchor="w", pady=(16, 6))
+        self.seg_size = ui.Segmented(ao, [(k, k) for k in WIN_SIZES], self.win_size, height=36, radius=9)
+        self.seg_size.pack(fill="x")
+        ui.divider(ao).pack(fill="x", pady=(16, 0))
+        row = tk.Frame(ao, bg=C["panel"])
+        row.pack(fill="x", pady=(16, 0))
+        self.tg_audio = ui.Toggle(row, self.audio)
+        self.tg_audio.pack(side="right")
+        lab = tk.Frame(row, bg=C["panel"])
+        lab.pack(side="left", fill="x")
+        t1 = ui.label(lab, "Звук телефона", 14, weight="semibold")
+        t1.pack(anchor="w")
+        t2 = ui.label(lab, "Android 11+. Пока включён, динамик телефона молчит", 12, C["muted"],
+                      wraplength=W - 110, justify="left")
+        t2.pack(anchor="w", pady=(2, 0))
+        for w in (t1, t2, lab):
+            w.bind("<ButtonRelease-1>", lambda e: self.tg_audio.toggle())
+
+        self.limit_row = lr = tk.Frame(sb, bg=C["panel"])
+        lr.pack(fill="x", pady=(16, 0))
+        right = tk.Frame(lr, bg=C["panel"])
+        right.pack(side="right")
+        self.f_limit = ui.Field(right, self.limit_mb, width=64, justify="right")
+        self.f_limit.pack(side="left")
+        ui.label(right, "МБ", 13, C["text2"]).pack(side="left", padx=(8, 0))
+        lab = tk.Frame(lr, bg=C["panel"])
+        lab.pack(side="left", fill="x")
+        ui.label(lab, "Видео не больше", 14, weight="semibold").pack(anchor="w")
+        ui.label(lab, "Больше — сожмётся при сохранении · 0 без лимита", 12, C["muted"]).pack(anchor="w", pady=(2, 0))
+
+        # низ: главная кнопка / панель записи iPhone / статус
+        self.footer = ft = tk.Frame(outer, bg=bg)
+        self.btn_main = ui.Button(ft, "Открыть трансляцию", self.toggle_connect, kind="primary", height=44,
+                                  radius=10, size=15)
+        self.recbar = ui.Card(ft, pad=8)
+        rb = self.recbar.body
+        self.pill = ui.RecPill(rb, self._pill_click, bg=C["panel"])
+        self.pill.pack(side="left", padx=(2, 0))
+        self.b_pause = ui.IconButton(rb, "pause", self.toggle_pause, "Пауза  (Ctrl+P)", bg=C["panel"])
+        self.b_pause.pack(side="left", padx=(4, 0))
+        self.b_stop = ui.IconButton(rb, "stop", self.stop_rec, "Остановить и сохранить  (Ctrl+S)", bg=C["panel"])
+        self.b_stop.pack(side="left", padx=(4, 0))
+        self.btn_disc = ui.Button(rb, "Отключить", self.toggle_connect, kind="secondary", height=32, radius=8,
+                                  size=13)
+        self.btn_disc.pack(side="right", padx=(0, 2))
+        self.status_lbl = ui.label(ft, "", 12, C["muted"], wraplength=W, justify="center")
+        self.status.trace_add("write", lambda *a: self.status_lbl.configure(text=self._status_text()))
+
+    def _status_text(self):
+        return self.status.get() or (ANDROID_NOTE if self.platform.get() == "Android" else IOS_NOTE)
+
+    def _num_field(self, grid, col, title, var, unit, padx):
+        box = tk.Frame(grid, bg=C["panel"])
+        box.grid(row=0, column=col, sticky="we", padx=padx)
+        ui.label(box, title, 12, C["text2"]).pack(anchor="w")
+        row = tk.Frame(box, bg=C["panel"])
+        row.pack(fill="x", pady=(6, 0))
+        ui.label(row, unit, 13, C["text2"]).pack(side="right", padx=(8, 0))
+        f = ui.Field(row, var, width=80)
+        f.pack(side="left", fill="x", expand=True)
+        return f
+
+    def _ap_steps(self):
+        name = self.ap_name.get().strip() or APP
+        self.ap_steps.configure(text="1.  Компьютер и iPhone — в одной сети Wi-Fi\n"
+                                     "2.  Нажмите «Подключить» внизу\n"
+                                     f"3.  На iPhone: Пункт управления → Повтор экрана → «{name}»")
+
+    def _layout(self):
+        """Порядок блоков зависит от режима: Android, iPhone по кабелю или по Wi-Fi."""
+        plat = self.platform.get()
+        for w in (self.dev_sec, self.ap_sec, self.set_card, self.footer):
+            w.pack_forget()
+        (self.ap_sec if plat == "AirPlay" else self.dev_sec).pack(fill="x", pady=(20, 0))
+        self.dev_title.configure(text="Телефоны" if plat == "Android" else "iPhone и iPad")
+        self.set_card.pack(fill="x", pady=(20, 0))
+        if plat == "Android":
+            self.android_opts.pack(fill="x", before=self.limit_row)
+        else:
+            self.android_opts.pack_forget()
+        self.footer.pack(fill="x", pady=(20, 22))
+
+    def _platform_changed(self):
+        self.devices, self.selected = [], []
+        self.status.set("")
+        self._render_rows()
+        self._layout()
+        self.update_buttons()
+        self.refresh()
+
+    def _render_rows(self):
+        body = self.dev_card.body
+        for w in body.winfo_children():
+            w.destroy()
+        self.rows = []
+        plat = self.platform.get()
+        if not self.devices:
+            box = tk.Frame(body, bg=C["panel"])
+            box.pack(fill="x", pady=14, padx=12)
+            if self.searching:
+                ui.label(box, "Ищу устройства…", 13, C["text2"]).pack()
+            else:
+                ui.label(box, "Телефоны не найдены" if plat == "Android" else "iPhone не найден", 14,
+                         weight="semibold").pack()
+                ui.label(box, "Подключите телефон кабелем и включите «Отладку по USB»,\nзатем нажмите «Обновить»."
+                         if plat == "Android" else
+                         "Подключите iPhone кабелем, разблокируйте и нажмите «Доверять»,\nзатем «Обновить».",
+                         12, C["muted"], justify="center").pack(pady=(4, 0))
+            return
+        for i, (uid, title, sub, ready) in enumerate(self.devices):
+            r = ui.DeviceRow(body, title, sub, ("ok", "Готов") if ready else ("wait", "Ждёт"), self._row_click,
+                             checked=uid in self.selected, enabled=ready, radio=plat != "Android")
+            r.uid = uid
+            r.ready = ready
+            r.pack(fill="x", pady=(0 if i == 0 else 4, 0))
+            self.rows.append(r)
+
+    def _row_click(self, row):
+        if self.busy or self.state != "idle":
+            return
+        if self.platform.get() == "Android":
+            if row.uid in self.selected:
+                self.selected.remove(row.uid)
+            else:
+                self.selected.append(row.uid)
+        else:
+            self.selected = [row.uid]
+        for r in self.rows:
+            r.set(checked=r.uid in self.selected)
+        self.update_buttons()
+
+    def _pill_click(self):
+        if self.state == "paused":
+            self.toggle_pause()
+        else:
+            self.start_rec()
 
     # --- фоновые операции, чтобы окно не зависало
     def bg(self, fn, done=None, fail=None, text=None):
@@ -682,40 +847,74 @@ class App:
 
     def update_buttons(self):
         s, b = self.state, self.busy
-        en = lambda w, on: w.state(["!disabled"] if on else ["disabled"])  # noqa
-        en(self.btn_refresh, not b and s == "idle")
-        en(self.dev_cb, not b and s == "idle")
-        self.dev_cb.configure(state="readonly" if (not b and s == "idle") else "disabled")
         plat = self.platform.get()
         android = plat == "Android"
-        (self.dev_list.grid if android else self.dev_list.grid_remove)()
-        (self.dev_cb.grid_remove if android else self.dev_cb.grid)()
-        self.dev_list.configure(state="normal" if (not b and s == "idle") else "disabled")
-        en(self.btn_conn, not b and s in ("idle", "connected"))
-        self.btn_conn.configure(text="Открыть трансляцию" if android else
-                                ("Отключить" if s != "idle" else "Подключить"),
-                                width=20 if android else 13)
-        for w in (self.btn_rec, self.btn_pause, self.btn_stop):
-            (w.grid_remove if android else w.grid)()
-        (self.timer_row.grid_remove if android else self.timer_row.grid)()
-        self.hint.configure(text="Отметьте один или несколько телефонов. Несколько откроются рядом, и запись "
-                                 "на любом из них пишет все экраны в одно видео (без звука). "
-                                 "Запись, пауза, звук и скриншоты — на панели вверху окна телефона."
-                            if android else
-                            "Горячие клавиши (в этом окне): Ctrl+R — запись, Ctrl+P — пауза, Ctrl+S — стоп")
-        en(self.btn_rec, not b and s in ("idle", "connected") and bool(self.devices))
-        en(self.btn_pause, not b and s in ("recording", "paused"))
-        self.btn_pause.configure(text="▶ Продолжить" if s == "paused" else "⏸ Пауза")
-        en(self.btn_stop, not b and s in ("recording", "paused"))
-        self.dot.configure(fg={"recording": "red", "paused": "orange", "connected": "green"}.get(s, "gray"))
-        (self.opts.grid if plat == "Android" else self.opts.grid_remove)()
-        (self.ap_opts.grid if plat == "AirPlay" else self.ap_opts.grid_remove)()
+        idle = s == "idle" and not b
+        self.tabs.set_enabled(s == "idle" and (not b or self.searching))
+        self.btn_refresh.set(enabled=idle and not self.searching)
+        for r in self.rows:
+            r.set(enabled=idle and r.ready)
+        for f in (self.f_size, self.f_rate, self.f_ap, self.f_limit):
+            f.set_enabled(idle)
+        self.seg_size.set_enabled(idle)
+        self.tg_audio.set_enabled(idle)
+        sel = [d for d in self.devices if d[0] in self.selected and d[3]]
+
+        # подсказка под списком
+        if android:
+            n = len(sel)
+            hint = ("" if not self.devices else
+                    "Отметьте телефон, чтобы открыть трансляцию." if n == 0 else
+                    "Окно телефона откроется с панелью записи сверху." if n == 1 else
+                    f"Отмечено {n} — окна откроются рядом, запись пойдёт в одно видео без звука.")
+        else:
+            hint = ("Запись сохраняется одним файлом, паузы вырезаются." if self.devices else "")
+        self.dev_hint.configure(text=hint)
+        if hint:
+            self.dev_hint.pack(anchor="w", pady=(10, 0))
+        else:
+            self.dev_hint.pack_forget()
+
+        # низ окна
+        for w in (self.btn_main, self.recbar, self.status_lbl):
+            w.pack_forget()
+        if android or s == "idle":
+            n = len(sel)
+            if android:
+                text = ("Открыть трансляцию" if n <= 1 else
+                        f"Открыть {n} {ui.plural(n, 'трансляцию', 'трансляции', 'трансляций')}")
+                ok = n > 0
+            else:
+                text, ok = "Подключить", plat == "AirPlay" or bool(sel)
+            self.btn_main.set(text=text, enabled=ok and not b and s == "idle")
+            self.btn_main.pack(fill="x")
+        else:
+            self.recbar.pack(fill="x")
+            self._update_recbar()
+        self.status_lbl.configure(text=self._status_text())
+        self.status_lbl.pack(fill="x", pady=(10, 0))
+
+    def _update_recbar(self):
+        s, b = self.state, self.busy
+        total = self.elapsed + (time.monotonic() - self.seg_started if self.seg_started else 0)
+        if self.saving:
+            self.pill.set("saving", "Сохранение", enabled=False, spin=int(time.monotonic() * 12) % 12 * 30)
+        elif s == "recording":
+            self.pill.set("recording", ui.fmt_hms(total), blink=int(time.monotonic() * 2) % 2 == 0)
+        elif s == "paused":
+            self.pill.set("paused", ui.fmt_hms(total), enabled=not b)
+        else:
+            self.pill.set("idle", "Запись", enabled=not b and s == "connected")
+        active = s in ("recording", "paused")
+        self.b_pause.set("play" if s == "paused" else "pause", active and not b,
+                         "Продолжить  (Ctrl+P)" if s == "paused" else "Пауза  (Ctrl+P)")
+        self.b_stop.set(enabled=active and not b, tone="raised" if active else "")
+        self.btn_disc.set(enabled=s == "connected" and not b)
 
     # --- устройства
     def refresh(self):
-        if self.state != "idle":
+        if self.state != "idle" or self.busy:
             return
-        self.update_buttons()
         plat = self.platform.get()
         ios = plat == "iOS"
         if plat == "AirPlay":
@@ -724,48 +923,63 @@ class App:
         else:
             fn = list_ios if ios else list_android
         text = ("Ищу iPhone/iPad (первый раз собирается хелпер, ~1 мин)…" if ios and not os.path.exists(HELPER)
-                else "Ищу устройства…")
+                else "")
+        self.searching = True
+        if plat != "AirPlay":
+            self.devices = []
+            self._render_rows()
+
+        def norm(d):
+            if len(d) >= 4:
+                return tuple(d[:4])
+            ready = "—" not in d[1]
+            return (d[0], d[1].split("  (")[0], "iPhone · USB" if ios else d[1], ready)
+
+        def stale():
+            """Пока искали, переключили режим — результат уже не нужен, ищем заново."""
+            if self.platform.get() == plat:
+                return False
+            self.root.after(20, self.refresh)
+            return True
 
         def done(devs):
-            self.devices = devs
-            self.dev_cb["values"] = [d[1] for d in devs]
-            self.dev_list.configure(state="normal")  # в заблокированный список Tk не вставляет
-            self.dev_list.delete(0, "end")
-            for d in devs:
-                self.dev_list.insert("end", d[1])
-            if devs:
-                self.dev_list.selection_set(0)
-            if devs and plat == "AirPlay":
-                self.dev_cb.current(0)
-                self.status.set("Нажмите «Подключить», затем на iPhone включите «Повтор экрана».")
-            elif devs:
-                self.dev_cb.current(0)
-                self.status.set(f"Найдено устройств: {len(devs)}. Нажмите «" + ("Открыть трансляцию" if plat == "Android" else "Подключить") + "».")
+            self.searching = False
+            if stale():
+                return
+            if plat == "AirPlay":
+                self.devices = []
+                self.status.set("")
+                return
+            prev = list(self.selected)
+            self.devices = [norm(d) for d in devs]
+            ready = [d[0] for d in self.devices if d[3]]
+            keep = [u for u in prev if u in ready]
+            if plat == "Android":
+                self.selected = keep or ready[:1]
             else:
-                self.device.set("")
-                self.status.set("Устройства не найдены. " + (
-                    "Подключите iPhone кабелем, разблокируйте и нажмите «Доверять»." if ios else
-                    "Включите «Отладку по USB» и подтвердите доступ на телефоне."))
+                self.selected = keep[:1] or ready[:1]
+            self._render_rows()
+            self.status.set("")
 
         def fail():
-            self.devices = []
-            self.dev_cb["values"] = []
-            self.dev_list.configure(state="normal")  # в заблокированный список Tk не вставляет
-            self.dev_list.delete(0, "end")
-            self.device.set("")
+            self.searching = False
+            if stale():
+                return
+            self.devices, self.selected = [], []
+            if plat != "AirPlay":
+                self._render_rows()
 
         self.bg(fn, done, fail, text)
 
     def make_engine(self):
-        idx = self.dev_cb.current()
-        if idx < 0:
-            raise RuntimeError("Выберите устройство.")
-        uid = self.devices[idx][0]
-        if self.platform.get() == "iOS":
-            return IOSEngine(uid)
         if self.platform.get() == "AirPlay":
             self.ap_hint = None
             return AirPlayEngine(self.ap_name.get())
+        sel = [d for d in self.devices if d[0] in self.selected and d[3]]
+        if not sel:
+            raise RuntimeError("Выберите устройство.")
+        if self.platform.get() == "iOS":
+            return IOSEngine(sel[0][0])
         raise RuntimeError("Android открывается в своём окне трансляции.")
 
     # --- Android: окна трансляции с панелью записи (одно или несколько связанных)
@@ -784,14 +998,9 @@ class App:
     def open_android(self):
         if self.busy or self.android_wins:
             return
-        idxs = list(self.dev_list.curselection())
-        if not idxs:
+        serials = [d[0] for d in self.devices if d[0] in self.selected and d[3]]
+        if not serials:
             messagebox.showwarning(APP, "Отметьте телефон в списке.")
-            return
-        serials = [self.devices[i][0] for i in idxs if self.devices[i][1].find("—") < 0]
-        if len(serials) < len(idxs):
-            messagebox.showwarning(APP, "Один из телефонов не готов (не разрешена отладка по USB). "
-                                        "Подтвердите доступ на телефоне и нажмите «Обновить».")
             return
         try:
             ms = int(self.max_size.get() or 0)
@@ -923,7 +1132,9 @@ class App:
         if self.busy or self.state not in ("recording", "paused"):
             return
         self._accumulate()
-        self.bg(self.engine.stop, lambda _: self.ask_save(), text="Завершаю запись…")
+        self.saving = True
+        self.bg(self.engine.stop, lambda _: self.ask_save(), lambda: setattr(self, "saving", False),
+                text="Завершаю запись…")
 
     def ask_save(self):
         ios = isinstance(self.engine, IOSEngine)
@@ -963,6 +1174,7 @@ class App:
                 lambda: self.after_record(None), "Сохраняю файл…")
 
     def after_record(self, msg):
+        self.saving = False
         self.state = "connected" if self.engine and self.engine.alive() else "idle"
         if msg:
             self.status.set(msg)
@@ -972,8 +1184,8 @@ class App:
 
     # --- таймер и контроль процессов
     def tick(self):
-        total = self.elapsed + (time.monotonic() - self.seg_started if self.seg_started else 0)
-        self.timer.set(fmt_time(total))
+        if self.state in ("connected", "recording", "paused"):
+            self._update_recbar()
         if not self.busy and isinstance(self.engine, AirPlayEngine) and self.engine.alive():
             hint = ("iPhone транслирует экран." if self.engine.client_connected() else
                     f"Ждём iPhone: Пункт управления → Повтор экрана → «{self.engine.name}».")

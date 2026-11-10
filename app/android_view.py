@@ -31,6 +31,9 @@ DEVICE_SERVER_PATH = "/data/local/tmp/scrcpy-server.jar"
 # --- протокол scrcpy 5.x -------------------------------------------------------
 CODEC_H264 = 0x68323634
 CODEC_AAC = 0x00616163
+CODEC_OPUS = 0x6F707573
+AUDIO_CODECS = {CODEC_AAC: "aac", CODEC_OPUS: "opus"}
+_USED_PORTS = set()
 FLAG_SESSION = 1 << 63
 FLAG_CONFIG = 1 << 62
 FLAG_KEY = 1 << 61
@@ -67,9 +70,42 @@ def msg_key(action, keycode):
     return struct.pack(">BBiii", MSG_KEYCODE, action, keycode, 0, 0)
 
 
+def msg_paste(text):
+    """Положить текст в буфер обмена телефона и сразу вставить (TYPE_SET_CLIPBOARD, paste=true)."""
+    data = text.encode("utf-8")
+    return struct.pack(">BQBI", 9, 0, 1, len(data)) + data
+
+
 def msg_text(text):
     data = text.encode("utf-8")[:300]
     return struct.pack(">BI", MSG_TEXT, len(data)) + data
+
+
+SOFT_ENCODERS = ("c2.android.avc.encoder", "OMX.google.h264.encoder")
+VIDEO_FAIL_MARKS = ("Video encoding error", "Capture/encoding error", "Could not create default video encoder",
+                    "Could not create video encoder")
+
+
+def input_help(manufacturer):
+    """Что включить на телефоне, если касания и клавиши не доходят (известно по scrcpy).
+    Возвращает {title, intro, steps, note} для подсказки в окне телефона."""
+    m = (manufacturer or "").lower()
+    title = "Касания не доходят до телефона"
+    if m in ("xiaomi", "redmi", "poco", "blackshark"):
+        return dict(title=title, intro="На Xiaomi, Redmi и POCO включите одну настройку и перезагрузите телефон:",
+                    steps=["Настройки → Расширенные настройки", "Для разработчиков",
+                           "«Отладка по USB (настройки безопасности)»"],
+                    note="Пункт требует вход в Mi-аккаунт и SIM-карту в телефоне.")
+    if m in ("oppo", "realme", "oneplus"):
+        return dict(title=title, intro="На OPPO, realme и OnePlus включите одну настройку и перезагрузите телефон:",
+                    steps=["Настройки → Для разработчиков",
+                           "«Отключить мониторинг разрешений» (Disable permission monitoring)"], note="")
+    if m in ("vivo", "iqoo"):
+        return dict(title=title, intro="На vivo и iQOO включите одну настройку и перезагрузите телефон:",
+                    steps=["Настройки → Для разработчиков", "«Отладка по USB (настройки безопасности)»"], note="")
+    return dict(title=title, intro="В «Для разработчиков» включите один из пунктов и перезагрузите телефон:",
+                steps=["«Отладка по USB (настройки безопасности)» / «USB debugging (Security settings)»",
+                       "или «Отключить мониторинг разрешений»"], note="")
 
 
 def recv_exact(sock, n):
@@ -97,7 +133,13 @@ class AndroidLink:
         self.adb, self.serial = adb, serial
         self.server_path, self.server_version = server_path, server_version
         self.max_size, self.bitrate, self.audio = max_size, bitrate_mbps, audio
-        self.log = os.path.join(log_dir, "android_server.log")
+        self.log_dir = log_dir
+        self.encoder = None  # None = кодировщик по умолчанию; иначе имя (например, программный)
+        self.props = {}
+        self._log_pos = 0
+        safe = "".join(ch if ch.isalnum() else "_" for ch in serial)
+        self.log = os.path.join(log_dir, f"android_server_{safe}.log")  # у каждого телефона свой лог
+        self.started_at = None
         self.proc = None
         self.port = None
         self.video = self.audio_sock = self.control = None
@@ -117,11 +159,10 @@ class AndroidLink:
     def start(self):
         if not self.server_path or not os.path.exists(self.server_path):
             raise RuntimeError("Не найден scrcpy-server. Переустановите Takeone.")
+        self.props = self._props()
         self._adb("push", self.server_path, DEVICE_SERVER_PATH, timeout=60)
         scid = random.randint(1, 0x7FFFFFFF)
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            self.port = s.getsockname()[1]
+        self.port = self._free_port()
         self._adb("forward", f"tcp:{self.port}", f"localabstract:scrcpy_{scid:08x}")
         args = [f"scid={scid:08x}", "log_level=info", "tunnel_forward=true",
                 f"video_bit_rate={int(self.bitrate * 1_000_000)}", "video_codec=h264",
@@ -129,13 +170,75 @@ class AndroidLink:
                 "power_off_on_close=false"]
         if self.max_size > 0:
             args.append(f"max_size={self.max_size}")
-        args += ["audio=true", "audio_codec=aac"] if self.audio else ["audio=false"]
+        if self.encoder:
+            args.append(f"video_encoder={self.encoder}")
+        args += ["audio=true", "audio_codec=opus"] if self.audio else ["audio=false"]
         cmd = [self.adb, "-s", self.serial, "shell", f"CLASSPATH={DEVICE_SERVER_PATH}", "app_process",
                "/", "com.genymobile.scrcpy.Server", self.server_version, *args]
         self._logf = open(self.log, "wb")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=self._logf,
                                      stderr=subprocess.STDOUT, creationflags=NOWIN)
         self._connect()
+        self.started_at = time.monotonic()
+
+    @staticmethod
+    def _free_port():
+        """Свой порт на каждый телефон: из диапазона scrcpy, не занятый ни системой, ни нами."""
+        for _ in range(200):
+            p = random.randint(27183, 28999)
+            if p in _USED_PORTS:
+                continue
+            with socket.socket() as s:
+                try:
+                    s.bind(("127.0.0.1", p))
+                except OSError:
+                    continue
+            _USED_PORTS.add(p)
+            return p
+        raise RuntimeError("Не нашёлся свободный сетевой порт для подключения телефона")
+
+    def clone(self, audio=None, max_size=None, encoder=None):
+        n = AndroidLink(self.adb, self.serial, self.server_path, self.server_version,
+                        self.max_size if max_size is None else max_size,
+                        self.bitrate, self.audio if audio is None else audio, self.log_dir)
+        n.encoder = self.encoder if encoder is None else encoder
+        return n
+
+    def _props(self):
+        try:
+            out = self._adb("shell", "getprop ro.product.manufacturer; getprop ro.build.version.sdk; "
+                                     "getprop ro.product.model", timeout=10).splitlines()
+        except Exception:  # noqa
+            return {}
+        out += ["", "", ""]
+        try:
+            sdk = int(out[1].strip())
+        except ValueError:
+            sdk = 0
+        return {"manufacturer": out[0].strip().lower(), "sdk": sdk, "model": out[2].strip()}
+
+    def new_log(self):
+        """Текст, который сервер дописал в лог с прошлого вызова."""
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self._log_pos)
+                data = f.read()
+                self._log_pos = f.tell()
+            return data.decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def log_text(self):
+        return _tail(self.log, 20000)
+
+    def error_hint(self):
+        """Последняя ошибка, которую сервер на телефоне написал в лог."""
+        lines = [ln.strip() for ln in _tail(self.log, 6000).splitlines()]
+        errs = [ln.split("ERROR:", 1)[1].strip() for ln in lines if "ERROR:" in ln]
+        if errs:
+            return errs[-1][:160]
+        exc = [ln for ln in lines if "Exception" in ln or "Error:" in ln]
+        return exc[-1][:160] if exc else ""
 
     def _connect(self, host="127.0.0.1"):
         deadline = time.time() + 15
@@ -169,9 +272,9 @@ class AndroidLink:
                 so.settimeout(None)
 
     # --- потоки чтения
-    def run(self, on_session, on_video, on_audio_config, on_audio, on_ended):
+    def run(self, on_session, on_video, on_audio_config, on_audio, on_ended, on_audio_none=None):
         self.cb = dict(session=on_session, video=on_video, aconf=on_audio_config, audio=on_audio,
-                       ended=on_ended)
+                       ended=on_ended, anone=on_audio_none or (lambda code: None))
         threading.Thread(target=self._video_loop, daemon=True).start()
         if self.audio_sock:
             threading.Thread(target=self._audio_loop, daemon=True).start()
@@ -180,7 +283,25 @@ class AndroidLink:
     def _end(self, reason):
         if not self._ended and not self._closing:
             self._ended = True
+            try:
+                with open(self.log, "ab") as f:
+                    f.write(f"\n[takeone] соединение завершено: {reason}\n".encode("utf-8"))
+            except OSError:
+                pass
             self.cb["ended"](reason)
+
+    def _safe(self, name, *args):
+        """Ошибка в обработке одного пакета не должна обрывать трансляцию."""
+        try:
+            self.cb[name](*args)
+        except Exception as e:  # noqa
+            if not getattr(self, "_cb_err_logged", False):
+                self._cb_err_logged = True
+                try:
+                    with open(self.log, "ab") as f:
+                        f.write(f"\n[takeone] ошибка обработки ({name}): {e!r}\n".encode("utf-8"))
+                except OSError:
+                    pass
 
     def _video_loop(self):
         try:
@@ -195,7 +316,7 @@ class AndroidLink:
                 hdr = recv_exact(self.video, 12)
                 if hdr[0] & 0x80:  # метаданные сессии: новый размер кадра
                     _, w, h = struct.unpack(">III", hdr)
-                    self.cb["session"](w, h)
+                    self._safe("session", w, h)
                     continue
                 ptsf, size = struct.unpack(">QI", hdr)
                 data = recv_exact(self.video, size)
@@ -204,26 +325,26 @@ class AndroidLink:
                     continue
                 if pending:
                     data, pending = pending + data, b""
-                self.cb["video"](data, ptsf & PTS_MASK, bool(ptsf & FLAG_KEY), config)
+                self._safe("video", data, ptsf & PTS_MASK, bool(ptsf & FLAG_KEY), config)
         except Exception as e:  # noqa
             self._end(str(e))
 
     def _audio_loop(self):
         try:
             codec = struct.unpack(">I", recv_exact(self.audio_sock, 4))[0]
-            if codec == 0:
-                return  # телефон не может отдать звук (Android < 11) — работаем без него
-            if codec == 1:
-                raise RuntimeError("ошибка звукового потока")
-            if codec != CODEC_AAC:
+            if codec in (0, 1):
+                self._safe("anone", codec)  # телефон не может отдать звук — работаем без него
+                return
+            name = AUDIO_CODECS.get(codec)
+            if name is None:
                 return
             while True:
                 ptsf, size = struct.unpack(">QI", recv_exact(self.audio_sock, 12))
                 data = recv_exact(self.audio_sock, size)
                 if ptsf & FLAG_CONFIG:
-                    self.cb["aconf"](data)
+                    self._safe("aconf", (name, data))
                 else:
-                    self.cb["audio"](data, ptsf & PTS_MASK)
+                    self._safe("audio", data, ptsf & PTS_MASK)
         except Exception:  # noqa
             pass  # звук не критичен; конец сессии ловит видеопоток
 
@@ -265,6 +386,7 @@ class AndroidLink:
                 self.proc.wait(3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        _USED_PORTS.discard(self.port)
         if self.port:
             try:
                 subprocess.run([self.adb, "-s", self.serial, "forward", "--remove", f"tcp:{self.port}"],
@@ -326,9 +448,10 @@ class AudioPlayer:
                                       callback=self._cb, latency="low")
         self.stream.start()
 
-    def set_config(self, asc):
-        self.dec = self.av.CodecContext.create("aac", "r")
-        self.dec.extradata = asc
+    def set_config(self, aconf):
+        codec, extradata = aconf
+        self.dec = self.av.CodecContext.create(codec, "r")
+        self.dec.extradata = extradata
 
     def push(self, data):
         if self.muted or self.dec is None:
@@ -432,7 +555,7 @@ class MkvWriter:
 
     def __init__(self, path, avcc, width, height, asc):
         self.f = open(path, "wb")
-        self.has_audio = asc is not None
+        self.has_audio = asc is not None  # asc = (кодек, extradata)
         self.f.write(_el(b"\x1A\x45\xDF\xA3",
                          _uint(b"\x42\x86", 1) + _uint(b"\x42\xF7", 1) + _uint(b"\x42\xF2", 4) +
                          _uint(b"\x42\xF3", 8) + _str(b"\x42\x82", "matroska") +
@@ -446,7 +569,8 @@ class MkvWriter:
         tracks = video
         if self.has_audio:
             tracks += _el(b"\xAE", _uint(b"\xD7", 2) + _uint(b"\x73\xC5", 2) + _uint(b"\x83", 2) +
-                          _uint(b"\x9C", 0) + _str(b"\x86", "A_AAC") + _el(b"\x63\xA2", asc) +
+                          _uint(b"\x9C", 0) + _str(b"\x86", "A_OPUS" if asc[0] == "opus" else "A_AAC") +
+                          _el(b"\x63\xA2", asc[1]) +
                           _el(b"\xE1", _el(b"\xB5", struct.pack(">d", 48000.0)) + _uint(b"\x9F", 2)))
         self.f.write(_el(b"\x16\x54\xAE\x6B", tracks))
         self.cluster_ts = None
@@ -652,17 +776,26 @@ def encode(ffmpeg, in_args, filt, dest, duration, limit_mb, audio, progress, tmp
         vb = int(vb * 0.85)
 
 
+def fmt_mb(v):
+    return (f"{v:.0f}" if v >= 10 else f"{v:.1f}".rstrip("0").rstrip(".")).replace(".", ",")
+
+
 def save_single(ffmpeg, src_mkv, dest, limit_mb, progress, tmpdir):
     """Один телефон: перепаковка без потерь; если файл больше лимита — сжатие до лимита."""
     ext = os.path.splitext(dest)[1].lower() or ".mp4"
     remux = os.path.join(tmpdir, "remux" + ext)
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src_mkv, "-map", "0", "-c", "copy"]
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src_mkv, "-map", "0",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "160k"]
     if ext in (".mp4", ".mov"):
         cmd += ["-movflags", "+faststart"]
     r = _run(cmd + [remux])
     if r.returncode:
         raise RuntimeError(r.stderr[-1200:])
     if limit_mb and os.path.getsize(remux) > limit_mb * 1_000_000:
+        if progress:
+            progress(0.0, f"Сжимаю до {fmt_mb(limit_mb)} МБ",
+                     f"Записалось {fmt_mb(os.path.getsize(remux) / 1_000_000)} МБ — это больше лимита. "
+                     "Трансляция продолжается.")
         fit_file(ffmpeg, remux, dest, limit_mb, progress, tmpdir)
     else:
         shutil.move(remux, dest)
@@ -707,287 +840,12 @@ def save_combined(ffmpeg, paths, sizes, dest, duration, limit_mb, progress, tmpd
     encode(ffmpeg, in_args, filt, dest, duration, limit_mb, False, progress, tmpdir)
 
 
-# --- оформление ------------------------------------------------------------------------
-C = {
-    "bar": "#1A1B20", "line": "#2A2C34", "hover": "#2C2E37", "press": "#373A45",
-    "icon": "#ECEDF2", "dim": "#5C5F6C", "red": "#E5484D", "red_hover": "#EE5F64",
-    "amber": "#F5A524", "amber_bg": "#3D3220", "pill": "#2A2C34", "pill_hover": "#33363F",
-    "video": "#0B0B0E", "toast": "#24252D",
-}
-TOP_H, BOT_H = 46, 42
+# --- оформление (общий набор виджетов «Студийный графит») ---------------------------------
+from ui_kit import (C, IconButton, RecPill, Button, box, paint, font, measure, icon_shapes,  # noqa: E402
+                    fmt_hms, plural)
+
+TOP_H, BOT_H = 48, 44
 MIN_W = 296
-
-# Иконки в сетке 24×24 (в духе Lucide): ("line", точки, толщина) | ("poly", точки) |
-# ("circle", cx, cy, r, толщина|None) | ("rrect", x0, y0, x1, y1, r, толщина|None) | ("arc", cx, cy, r, нач, длина, толщина)
-_SPEAKER = ("poly", [(3.5, 9.5), (7.5, 9.5), (12, 5.6), (12, 18.4), (7.5, 14.5), (3.5, 14.5)])
-ICONS = {
-    "pause": [("rrect", 6.5, 5, 10.5, 19, 1.6, None), ("rrect", 13.5, 5, 17.5, 19, 1.6, None)],
-    "play": [("poly", [(8, 5.4), (18.8, 12), (8, 18.6)])],
-    "stop": [("rrect", 6, 6, 18, 18, 3, None)],
-    "camera": [("rrect", 3, 7.5, 21, 19.5, 3.2, 2), ("line", [(8.6, 7.5), (10, 5), (14, 5), (15.4, 7.5)], 2),
-               ("circle", 12, 13.4, 3.4, 2)],
-    "sound": [_SPEAKER, ("arc", 12.5, 12, 4.2, -55, 110, 2), ("arc", 12.5, 12, 8, -55, 110, 2)],
-    "muted": [_SPEAKER, ("line", [(15.5, 9.5), (20.5, 14.5)], 2), ("line", [(20.5, 9.5), (15.5, 14.5)], 2)],
-    "back": [("line", [(14.5, 5.5), (8, 12), (14.5, 18.5)], 2.4)],
-    "home": [("circle", 12, 12, 7, 2.2)],
-    "recents": [("rrect", 6, 6, 18, 18, 3.2, 2.2)],
-}
-
-
-def icon_shapes(name, x, y, size, color):
-    """Иконка из сетки 24×24 в пиксельные фигуры с левым верхним углом (x, y)."""
-    k = size / 24
-
-    def P(px, py):
-        return (x + px * k, y + py * k)
-
-    out = []
-    for op in ICONS[name]:
-        t = op[0]
-        if t == "line":
-            out.append(("line", [P(*p) for p in op[1]], color, op[2] * k))
-        elif t == "poly":
-            out.append(("poly", [P(*p) for p in op[1]], color))
-        elif t == "circle":
-            cx, cy = P(op[1], op[2])
-            out.append(("circle", cx, cy, op[3] * k, color, op[4] and op[4] * k))
-        elif t == "rrect":
-            x0, y0 = P(op[1], op[2])
-            x1, y1 = P(op[3], op[4])
-            out.append(("rrect", x0, y0, x1, y1, op[5] * k, color, op[6] and op[6] * k))
-        elif t == "arc":
-            cx, cy = P(op[1], op[2])
-            out.append(("arc", cx, cy, op[3] * k, op[4], op[5], color, op[6] * k))
-    return out
-
-
-def _rounded(c, x0, y0, x1, y1, r, **kw):
-    r = min(r, (x1 - x0) / 2, (y1 - y0) / 2)
-    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
-           x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-    return c.create_polygon(pts, smooth=True, **kw)
-
-
-def _tk_shape(c, sh):
-    t = sh[0]
-    if t == "line":
-        c.create_line(*[v for p in sh[1] for v in p], fill=sh[2], width=sh[3], capstyle="round",
-                      joinstyle="round")
-    elif t == "poly":
-        c.create_polygon(*[v for p in sh[1] for v in p], fill=sh[2], outline=sh[2], width=1.4,
-                         joinstyle="round")
-    elif t == "circle":
-        _, cx, cy, r, col, w = sh
-        if w:
-            c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=col, width=w)
-        else:
-            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col, outline="")
-    elif t == "rrect":
-        _, x0, y0, x1, y1, r, col, w = sh
-        if w:
-            _rounded(c, x0, y0, x1, y1, r, fill="", outline=col, width=w)
-        else:
-            _rounded(c, x0, y0, x1, y1, r, fill=col, outline="")
-    elif t == "arc":
-        _, cx, cy, r, start, ext, col, w = sh
-        c.create_arc(cx - r, cy - r, cx + r, cy + r, start=start, extent=ext, style="arc", outline=col,
-                     width=w)
-
-
-def _rgba(hexcol):
-    hexcol = hexcol.lstrip("#")
-    return tuple(int(hexcol[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
-
-
-def _pil_render(w, h, shapes, ss=4):
-    from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-
-    def S(v):
-        return v * ss
-
-    for sh in shapes:
-        t = sh[0]
-        if t == "line":
-            pts = [(S(x), S(y)) for x, y in sh[1]]
-            col, wd = _rgba(sh[2]), max(1, round(S(sh[3])))
-            d.line(pts, fill=col, width=wd, joint="curve")
-            for x, y in (pts[0], pts[-1]):
-                d.ellipse((x - wd / 2, y - wd / 2, x + wd / 2, y + wd / 2), fill=col)
-        elif t == "poly":
-            pts = [(S(x), S(y)) for x, y in sh[1]]
-            col = _rgba(sh[2])
-            d.polygon(pts, fill=col)
-            d.line(pts + [pts[0]], fill=col, width=round(S(1.4)), joint="curve")
-        elif t == "circle":
-            _, cx, cy, r, col, wd = sh
-            box = (S(cx - r), S(cy - r), S(cx + r), S(cy + r))
-            if wd:
-                d.ellipse(box, outline=_rgba(col), width=max(1, round(S(wd))))
-            else:
-                d.ellipse(box, fill=_rgba(col))
-        elif t == "rrect":
-            _, x0, y0, x1, y1, r, col, wd = sh
-            box = (S(x0), S(y0), S(x1), S(y1))
-            if wd:
-                d.rounded_rectangle(box, radius=S(r), outline=_rgba(col), width=max(1, round(S(wd))))
-            else:
-                d.rounded_rectangle(box, radius=S(r), fill=_rgba(col))
-        elif t == "arc":
-            _, cx, cy, r, start, ext, col, wd = sh
-            d.arc((S(cx - r), S(cy - r), S(cx + r), S(cy + r)), start=start, end=start + ext,
-                  fill=_rgba(col), width=max(1, round(S(wd))))
-    return img.resize((w, h), Image.LANCZOS)
-
-
-_IMG_CACHE = {}
-
-
-def paint(c, w, h, shapes, tag="paint"):
-    """Векторно на Mac (Tk там сглаживает и рисует чётко на Retina), иначе — сглаженной картинкой PIL."""
-    c.delete(tag)
-    if IS_MAC:
-        before = set(c.find_all())
-        for sh in shapes:
-            _tk_shape(c, sh)
-        for item in set(c.find_all()) - before:
-            c.addtag_withtag(tag, item)
-        return
-    from PIL import ImageTk
-    key = (w, h, repr(shapes))
-    img = _IMG_CACHE.get(key)
-    if img is None:
-        img = _IMG_CACHE[key] = ImageTk.PhotoImage(_pil_render(w, h, shapes), master=c)
-    c.create_image(0, 0, anchor="nw", image=img, tags=(tag,))
-
-
-class Tooltip:
-    def __init__(self, widget, text_fn):
-        self.w, self.text_fn = widget, text_fn
-        self.win = self.job = None
-        widget.bind("<Enter>", self._enter, add="+")
-        widget.bind("<Leave>", self._leave, add="+")
-        widget.bind("<ButtonPress>", self._leave, add="+")
-
-    def _enter(self, _):
-        self.job = self.w.after(650, self._show)
-
-    def _leave(self, _):
-        if self.job:
-            self.w.after_cancel(self.job)
-            self.job = None
-        if self.win:
-            self.win.destroy()
-            self.win = None
-
-    def _show(self):
-        text = self.text_fn()
-        if not text:
-            return
-        self.win = tw = tk.Toplevel(self.w)
-        tw.wm_overrideredirect(True)
-        tk.Label(tw, text=text, bg="#2B2C33", fg="#ECEDF2", padx=9, pady=5,
-                 font=("TkDefaultFont", 11)).pack()
-        tw.update_idletasks()
-        x = self.w.winfo_rootx() + self.w.winfo_width() // 2 - tw.winfo_width() // 2
-        tw.wm_geometry(f"+{max(0, x)}+{self.w.winfo_rooty() + self.w.winfo_height() + 6}")
-
-
-class IconButton(tk.Canvas):
-    SIZE = 34
-    GLYPH = 22
-
-    def __init__(self, parent, icon, command, tip=""):
-        s = self.SIZE
-        super().__init__(parent, width=s, height=s, bg=C["bar"], highlightthickness=0, bd=0)
-        self.icon, self.command, self.tip = icon, command, tip
-        self.enabled = True
-        self.hover = self.pressed = False
-        self.bind("<Enter>", lambda e: self._set(hover=True))
-        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
-        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
-        self.bind("<ButtonRelease-1>", self._release)
-        Tooltip(self, lambda: self.tip)
-        self._draw()
-
-    def set(self, icon=None, enabled=None, tip=None):
-        changed = False
-        for k, v in (("icon", icon), ("enabled", enabled), ("tip", tip)):
-            if v is not None and getattr(self, k) != v:
-                setattr(self, k, v)
-                changed = True
-        if changed:
-            self._draw()
-
-    def _set(self, **kw):
-        for k, v in kw.items():
-            setattr(self, k, v)
-        self._draw()
-
-    def _draw(self):
-        s, g = self.SIZE, self.GLYPH
-        shapes = []
-        if self.enabled and (self.hover or self.pressed):
-            shapes.append(("rrect", 1, 1, s - 1, s - 1, 9, C["press"] if self.pressed else C["hover"], None))
-        shapes += icon_shapes(self.icon, (s - g) / 2, (s - g) / 2, g, C["icon"] if self.enabled else C["dim"])
-        self.configure(cursor="hand2" if self.enabled else "")
-        paint(self, s, s, shapes)
-
-    def _release(self, e):
-        self._set(pressed=False)
-        if self.enabled and 0 <= e.x < self.SIZE and 0 <= e.y < self.SIZE:
-            self.command()
-
-
-class RecPill(tk.Canvas):
-    """Плашка записи: «● Запись» → красная с таймером → янтарная «Пауза»."""
-    W, H = 118, 30
-
-    def __init__(self, parent, command):
-        super().__init__(parent, width=self.W, height=self.H, bg=C["bar"], highlightthickness=0, bd=0)
-        self.command = command
-        self.state, self.text, self.enabled, self.hover, self.blink = "idle", "Запись", True, False, True
-        self.bind("<Enter>", lambda e: self._h(True))
-        self.bind("<Leave>", lambda e: self._h(False))
-        self.bind("<ButtonRelease-1>", lambda e: self.enabled and self.state in ("idle", "paused") and self.command())
-        Tooltip(self, lambda: {"idle": "Начать запись  (Ctrl+R)", "paused": "Продолжить запись  (Ctrl+P)"}
-                .get(self.state, ""))
-        self._draw()
-
-    def _h(self, v):
-        self.hover = v
-        self._draw()
-
-    def set(self, state, text, enabled=True, blink=True):
-        if (state, text, enabled, blink) != (self.state, self.text, self.enabled, self.blink):
-            self.state, self.text, self.enabled, self.blink = state, text, enabled, blink
-            self._draw()
-
-    def _draw(self):
-        W, H, st = self.W, self.H, self.state
-        clickable = self.enabled and st in ("idle", "paused")
-        if st == "recording":
-            bg, dot, fg = C["red"], ("#FFFFFF" if self.blink else C["red"]), "#FFFFFF"
-        elif st == "paused":
-            bg, dot, fg = C["amber_bg"], None, C["amber"]
-        elif st == "saving":
-            bg, dot, fg = C["pill"], None, C["icon"]
-        else:
-            bg = C["pill_hover"] if (self.hover and clickable) else C["pill"]
-            dot, fg = (C["red"] if self.enabled else C["dim"]), (C["icon"] if self.enabled else C["dim"])
-        shapes = [("rrect", 0.5, 0.5, W - 0.5, H - 0.5, H / 2, bg, None)]
-        if st == "paused":
-            shapes += [("rrect", 13, 10, 16.5, 20, 1.2, C["amber"], None),
-                       ("rrect", 19.5, 10, 23, 20, 1.2, C["amber"], None)]
-        elif dot:
-            shapes.append(("circle", 18, H / 2, 5, dot, None))
-        paint(self, W, H, shapes)
-        self.delete("txt")
-        mono = st in ("recording", "paused")
-        self.create_text(31, H / 2, text=self.text, anchor="w", fill=fg, tags=("txt",),
-                         font=("TkFixedFont" if mono else "TkDefaultFont", 12, "bold"))
-        self.configure(cursor="hand2" if clickable else "")
 
 
 def open_folder(path):
@@ -1000,11 +858,6 @@ def open_folder(path):
             subprocess.Popen(["xdg-open", path])
     except Exception:  # noqa
         pass
-
-
-def fmt_hms(t):
-    t = int(t)
-    return f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60:02d}:{t % 60:02d}"
 
 
 # --- запись одного или нескольких окон ---------------------------------------------------
@@ -1045,8 +898,12 @@ class RecordGroup:
         for w in self.members:
             w._toast(text, folder, sticky)
 
+    def alive(self):
+        return [w for w in self.members if w.ended is None]
+
     def ready(self):
-        return bool(self.members) and all(w.ready() for w in self.members)
+        alive = self.alive()
+        return bool(alive) and all(w.ready() for w in alive)
 
     def arrange(self):
         """Окна нескольких телефонов — рядом по центру экрана (один раз)."""
@@ -1069,10 +926,11 @@ class RecordGroup:
         if self.state != "idle" or not self.ready():
             return
         self.tmp = tempfile.mkdtemp(prefix="takeone_rec_", dir=self.tmp_root)
-        self.multi_rec = self.multi
+        rec_members = self.alive()
+        self.multi_rec = len(rec_members) > 1
         self.timeline = Timeline() if self.multi_rec else None
-        for i, w in enumerate(self.members):
-            asc = None if self.multi_rec else w.asc  # общая запись — без звука
+        for i, w in enumerate(rec_members):
+            asc = None if self.multi_rec else w.aconf  # общая запись — без звука
             w.recorder = Recorder(os.path.join(self.tmp, f"dev{i}.mkv"), w.dev_size, asc, self.timeline)
             w.recorder.start()
             w.link.reset_video()  # телефон сразу присылает ключевой кадр
@@ -1089,9 +947,9 @@ class RecordGroup:
                     w.recorder.pause()
             self.elapsed += time.monotonic() - self.since
             self.since, self.state = None, "paused"
-            self.toast("Пауза")
+            self.toast("Пауза — эта часть не попадёт в видео")
         elif self.state == "paused":
-            if any(w.ended for w in self.members):
+            if not any(w.recorder and w.ended is None for w in self.members):
                 return
             if self.timeline:
                 self.timeline.resume()
@@ -1146,12 +1004,28 @@ class RecordGroup:
                 shutil.rmtree(self.tmp, ignore_errors=True)
                 self._done("Запись удалена")
                 return then and then()
-        self.toast("Сохраняю…", sticky=True)
         tmp, multi, limit = self.tmp, self.multi_rec, self.limit_mb
         anchor = parent
+        fname = os.path.basename(dest)
+        if multi:
+            title = "Склеиваю видео" + (f" · до {fmt_mb(limit)} МБ" if limit else "")
+            note = f"{len(files)} {plural(len(files), 'экран', 'экрана', 'экранов')} рядом, без звука. " \
+                   "Трансляция продолжается."
+        else:
+            title, note = "Сохраняю видео", "Трансляция продолжается."
+        info = {"title": title, "note": note, "frac": 0.0, "file": fname}
+        self.save_card(info)
 
-        def progress(f):
-            anchor.after(0, lambda: self.toast(f"Сохраняю… {int(f * 100)}%", sticky=True))
+        def progress(f, new_title=None, new_note=None):
+            def upd():
+                info["frac"] = f
+                if new_title:
+                    info["title"] = new_title
+                if new_note:
+                    info["note"] = new_note
+                if self.state == "saving":
+                    self.save_card(info)
+            anchor.after(0, upd)
 
         def work():
             err = None
@@ -1180,8 +1054,13 @@ class RecordGroup:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def save_card(self, info):
+        for w in self.members:
+            w._save_card(info)
+
     def _done(self, msg, folder=None):
         self.state, self.elapsed, self.since, self.timeline = "idle", 0.0, None, None
+        self.save_card(None)
         self.refresh()
         self.toast(msg, folder)
 
@@ -1208,8 +1087,9 @@ class DeviceWindow(tk.Toplevel):
                 self.player = AudioPlayer()
             except Exception:  # noqa — нет звуковой карты/драйвера
                 self.player = None
-        self.asc = None
+        self.aconf = None
         self.dev_size = None
+        self.retried_no_audio = False
         self.sized_for = None
         self.shown_seq = -1
         self.photo = None
@@ -1223,47 +1103,63 @@ class DeviceWindow(tk.Toplevel):
 
         self._build()
         self._bind_input()
-        link.run(self._on_session, self._on_video, self._on_audio_config, self._on_audio, self._on_ended)
+        self.video_retries = 0
+        self.audio_none = None
+        self.input_warned = False
+        link.run(self._on_session, self._on_video, self._on_audio_config, self._on_audio, self._on_ended,
+                 self._on_audio_none)
         self.after(10, self._tick)
+        self.after(1000, self._watch_log)
 
     # --- построение окна
     def _build(self):
-        top = tk.Frame(self, bg=C["bar"], height=TOP_H)
+        bar = C["panel"]
+        top = tk.Frame(self, bg=bar, height=TOP_H)
         top.pack(side="top", fill="x")
         top.pack_propagate(False)
         tk.Frame(self, bg=C["line"], height=1).pack(side="top", fill="x")
-        left = tk.Frame(top, bg=C["bar"])
-        left.pack(side="left", padx=(8, 0), pady=(TOP_H - RecPill.H) // 2)
-        self.pill = RecPill(left, self._rec_click)
+        left = tk.Frame(top, bg=bar)
+        left.pack(side="left", padx=(10, 0), pady=(TOP_H - RecPill.H) // 2)
+        self.pill = RecPill(left, self._rec_click, bg=bar)
         self.pill.pack(side="left")
-        self.b_pause = IconButton(left, "pause", self.group.toggle_pause, "Пауза  (Ctrl+P)")
-        self.b_stop = IconButton(left, "stop", self.stop_rec, "Остановить и сохранить  (Ctrl+S)")
-        self.b_pause.pack(side="left", padx=(6, 0))
-        self.b_stop.pack(side="left")
-        right = tk.Frame(top, bg=C["bar"])
-        right.pack(side="right", padx=(0, 6))
-        self.b_sound = IconButton(right, "sound", self.toggle_sound, "Звук на компьютере  (Ctrl+M)")
-        self.b_shot = IconButton(right, "camera", self.screenshot, "Скриншот  (Ctrl+Shift+S)")
+        self.b_pause = IconButton(left, "pause", self.group.toggle_pause, "Пауза  (Ctrl+P)", bg=bar)
+        self.b_stop = IconButton(left, "stop", self.stop_rec, "Остановить и сохранить  (Ctrl+S)", bg=bar)
+        self.b_pause.pack(side="left", padx=(4, 0))
+        self.b_stop.pack(side="left", padx=(4, 0))
+        right = tk.Frame(top, bg=bar)
+        right.pack(side="right", padx=(0, 8))
+        self.b_sound = IconButton(right, "sound", self.toggle_sound, "Звук на компьютере  (Ctrl+M)", bg=bar)
+        self.b_shot = IconButton(right, "camera", self.screenshot, "Скриншот  (Ctrl+Shift+S)", bg=bar)
         self.b_sound.pack(side="right")
-        self.b_shot.pack(side="right")
+        self.b_shot.pack(side="right", padx=(0, 2))
 
-        bottom = tk.Frame(self, bg=C["bar"], height=BOT_H)
+        bottom = tk.Frame(self, bg=bar, height=BOT_H)
         bottom.pack(side="bottom", fill="x")
         bottom.pack_propagate(False)
         tk.Frame(self, bg=C["line"], height=1).pack(side="bottom", fill="x")
-        nav = tk.Frame(bottom, bg=C["bar"])
+        nav = tk.Frame(bottom, bg=bar)
         nav.place(relx=0.5, rely=0.5, anchor="center")
+        self.nav_buttons = []
         for icon, code, tip in (("back", KEY_BACK, "Назад  (Esc, правая кнопка мыши)"),
                                 ("home", KEY_HOME, "Домой  (средняя кнопка мыши)"),
                                 ("recents", KEY_APP_SWITCH, "Недавние приложения")):
-            IconButton(nav, icon, lambda c=code: self.link.key(c), tip).pack(side="left", padx=18)
+            b = IconButton(nav, icon, lambda c=code: self.link.key(c), tip, bg=bar)
+            b.pack(side="left", padx=20)
+            self.nav_buttons.append(b)
 
         self.canvas = tk.Canvas(self, bg=C["video"], highlightthickness=0, bd=0, width=MIN_W, height=640)
         self.canvas.pack(side="top", fill="both", expand=True)
         self.img_item = self.canvas.create_image(0, 0, anchor="nw")
-        self.msg_item = self.canvas.create_text(MIN_W / 2, 320, text="Подключение…", fill="#8E90A0",
-                                                font=("TkDefaultFont", 14), justify="center")
+        self.msg_item = self.canvas.create_text(MIN_W / 2, 320, text="Подключение…", fill=C["muted"],
+                                                font=font(14), justify="center")
+        self._frame_state = None
+        self._save_info = None
+        self._disc_btn = None
         self._update_controls()
+
+    def _csize(self):
+        c = self.canvas
+        return max(c.winfo_width(), int(c.cget("width"))), max(c.winfo_height(), int(c.cget("height")))
 
     def _rec_click(self):
         if self.group.state == "idle":
@@ -1279,24 +1175,46 @@ class DeviceWindow(tk.Toplevel):
         s = g.state
         alive = self.ended is None
         t = fmt_hms(g.time())
-        both = f" ×{len(g.members)}" if g.multi and s in ("recording", "paused") else ""
+        both = f" ×{sum(1 for m in g.members if m.recorder)}" if g.multi_rec and s in ("recording", "paused") else ""
         if s == "recording":
             self.pill.set("recording", t + both, blink=int(time.monotonic() * 2) % 2 == 0)
         elif s == "paused":
             self.pill.set("paused", t + both)
         elif s == "saving":
-            self.pill.set("saving", "Сохранение", enabled=False)
+            self.pill.set("saving", "Сохранение", enabled=False, spin=int(time.monotonic() * 12) % 12 * 30)
         else:
-            self.pill.set("idle", "Запись вместе" if g.multi else "Запись", enabled=alive and g.ready())
-        self.b_pause.set("play" if s == "paused" else "pause", s in ("recording", "paused"),
+            n = len(g.alive())
+            self.pill.set("idle", f"Запись ×{n}" if n > 1 else "Запись", enabled=alive and g.ready())
+        active = s in ("recording", "paused")
+        self.b_pause.set("play" if s == "paused" else "pause", active,
                          "Продолжить  (Ctrl+P)" if s == "paused" else "Пауза  (Ctrl+P)")
-        self.b_stop.set(enabled=s in ("recording", "paused"))
+        self.b_stop.set(enabled=active, tone="raised" if active else "")
         self.b_shot.set(enabled=alive and self.shown_seq >= 0)
         if self.player is None:
-            self.b_sound.set("muted", False, "Звук недоступен (нужен Android 11+ и включённый звук)")
+            self.b_sound.set("muted", False, "Звук недоступен (нужен Android 11+ и включённый звук)", tone="")
         else:
-            self.b_sound.set("muted" if self.player.muted else "sound", alive,
-                             "Включить звук  (Ctrl+M)" if self.player.muted else "Выключить звук  (Ctrl+M)")
+            muted = self.player.muted
+            self.b_sound.set("muted" if muted else "sound", alive,
+                             "Включить звук  (Ctrl+M)" if muted else "Выключить звук  (Ctrl+M)",
+                             tone="warn" if muted else "")
+        for b in self.nav_buttons:
+            b.set(enabled=alive)
+        fs = s if (active and self.recorder is not None and alive) else None
+        if fs != self._frame_state:
+            self._frame_state = fs
+            self._draw_frame()
+
+    def _draw_frame(self):
+        """Тонкая рамка вокруг экрана: красная — идёт запись, янтарная — пауза."""
+        c = self.canvas
+        c.delete("recframe")
+        if not self._frame_state:
+            return
+        cw, ch = self._csize()
+        col = C["rec"] if self._frame_state == "recording" else C["paused_frame"]
+        c.create_rectangle(1, 1, cw - 1, ch - 1, outline=col, width=2, tags=("recframe",))
+        c.tag_lower("recframe")
+        c.tag_raise("recframe", self.img_item)
 
     # --- данные от телефона (потоки)
     def _on_session(self, w, h):
@@ -1308,10 +1226,10 @@ class DeviceWindow(tk.Toplevel):
             rec.video(data, pts, key, config)
         self.decoder.decode(data)
 
-    def _on_audio_config(self, asc):
-        self.asc = asc
+    def _on_audio_config(self, aconf):
+        self.aconf = aconf
         if self.player:
-            self.player.set_config(asc)
+            self.player.set_config(aconf)
 
     def _on_audio(self, data, pts):
         rec = self.recorder
@@ -1319,6 +1237,69 @@ class DeviceWindow(tk.Toplevel):
             rec.audio(data, pts)
         if self.player:
             self.player.push(data)
+
+    def _on_audio_none(self, code):
+        self.audio_none = code
+
+    def _watch_log(self):
+        """Следим за логом сервера: известные проблемы показываем понятным текстом."""
+        if self._closing:
+            return
+        text = self.link.new_log()
+        if "INJECT_EVENTS" in text and not self.input_warned:
+            self.input_warned = True
+            self._banner(input_help(self.link.props.get("manufacturer")))
+        if self.audio_none is not None and self.audio_none is not True:
+            self.audio_none = True
+            if self.player:
+                self.player.close()
+                self.player = None
+            sdk = self.link.props.get("sdk", 0)
+            if 0 < sdk < 30:
+                ver = {21: "5", 22: "5.1", 23: "6", 24: "7", 25: "7.1", 26: "8", 27: "8.1", 28: "9", 29: "10"}
+                self._toast(f"Звука нет: нужен Android 11+, на телефоне Android {ver.get(sdk, sdk)}")
+            elif sdk == 30:
+                self._toast("Звука нет: на Android 11 разблокируйте экран и нажмите сюда",
+                            action=lambda: self.reconnect(audio=True))
+            else:
+                self._toast("Телефон не отдал звук — работаю без звука")
+        self.after(1000, self._watch_log)
+
+    def _banner(self, info):
+        """Постоянная подсказка вверху видео (закрывается крестиком)."""
+        if isinstance(info, str):
+            info = dict(title=info, intro="", steps=[], note="")
+        c = self.canvas
+        c.delete("banner")
+        cw, _ = self._csize()
+        x0, x1, top, pad = 12, cw - 12, 12, 14
+        inner = x1 - x0 - 2 * pad
+        tx, y = x0 + pad, top + pad
+        tags = ("banner", "banner_fg")
+        paint(c, 18, 18, icon_shapes("alert", 0, 0, 18, C["amber_text"]), tag=tags, x=tx, y=y, clear=False)
+        title = c.create_text(tx + 28, y - 1, text=info["title"], anchor="nw", fill=C["hint_title"],
+                              width=inner - 28 - 30, font=font(14, "semibold"), tags=tags)
+        paint(c, 28, 28, icon_shapes("close", 6, 6, 16, C["hint_title"]), tag=tags + ("banner_x",),
+              x=x1 - pad - 24, y=y - 6, clear=False)
+        y = max(c.bbox(title)[3], y + 18) + 8
+        parts = []  # (текст, цвет, размер, отступ сверху)
+        if info.get("intro"):
+            parts.append((info["intro"], C["hint_text"], 13, 0))
+        for i, step in enumerate(info.get("steps") or [], 1):
+            parts.append((f"{i}.  {step}", C["hint_title"], 13, 8 if i == 1 else 3))
+        if info.get("note"):
+            parts.append((info["note"], C["hint_note"], 12, 10))
+        for text, col, size, gap in parts:
+            item = c.create_text(tx, y + gap, text=text, anchor="nw", fill=col, width=inner, font=font(size),
+                                 tags=tags)
+            y = c.bbox(item)[3]
+        bottom = y + pad + 2
+        paint(c, x1 - x0, bottom - top, box(0, 0, x1 - x0, bottom - top, 14, C["amber_bg"], C["amber_line"]),
+              tag=("banner", "banner_bg"), x=x0, y=top, clear=False)
+        c.tag_lower("banner_bg", "banner_fg")
+        c.tag_bind("banner_x", "<ButtonRelease-1>", lambda e: c.delete("banner"))
+        c.tag_bind("banner_x", "<Enter>", lambda e: c.configure(cursor="hand2"))
+        c.tag_bind("banner_x", "<Leave>", lambda e: c.configure(cursor=""))
 
     def _on_ended(self, reason):
         self.ended = reason or "соединение закрыто"
@@ -1336,11 +1317,154 @@ class DeviceWindow(tk.Toplevel):
         self._update_controls()
         if self.ended is not None and not self.ended_handled:
             self.ended_handled = True
-            self.canvas.itemconfigure(self.msg_item, text="Устройство отключено")
-            self.canvas.itemconfigure(self.img_item, state="hidden")
-            self.canvas.tag_raise(self.msg_item)
-            self.group.member_ended(self)
+            self._handle_ended()
         self.after(15, self._tick)
+
+    # --- отключение и переподключение
+    def _handle_ended(self):
+        link = self.link
+        quick = link.started_at is not None and time.monotonic() - link.started_at < 10
+        self.group.member_ended(self)
+        log = link.log_text()
+        if quick and any(m in log for m in VIDEO_FAIL_MARKS) and self.video_retries < 2:
+            # Кодировщик видео на телефоне не справился: сначала меньше разрешение, потом программный кодировщик.
+            self.video_retries += 1
+            if self.video_retries == 1:
+                ms = 1280 if (link.max_size == 0 or link.max_size > 1280) else 1024
+                enc = None
+            else:
+                ms = min(link.max_size or 1280, 1280)
+                enc = SOFT_ENCODERS[0] if link.props.get("sdk", 0) >= 29 else SOFT_ENCODERS[1]
+            self._show_disconnected("Переподключаюсь…", "Видеокодер телефона дал сбой — пробую упрощённый режим видео.",
+                                    button=False)
+            self.reconnect(max_size=ms, encoder=enc,
+                           note=f"Видеокодер телефона дал сбой — показываю в {ms}p"
+                                + (" (программное кодирование)" if enc else ""))
+            return
+        if quick and link.audio and not self.retried_no_audio:
+            # Частая причина на некоторых телефонах — сбой захвата звука на стороне Android:
+            # пробуем сразу ещё раз, но без звука.
+            self.retried_no_audio = True
+            self._show_disconnected("Переподключаюсь…", "Телефон не смог отдать звук — пробую без звука.",
+                                    button=False)
+            self.reconnect(audio=False, note="Звук с этого телефона не удалось получить — работаю без звука")
+            return
+        hint = link.error_hint()
+        self._show_disconnected("Телефон отключён",
+                                "Проверьте кабель и что экран телефона разблокирован, затем подключите снова.",
+                                detail=hint or (self.ended if self.ended not in (None, "соединение закрыто") else ""))
+
+    def _clear_disc(self):
+        self.canvas.delete("disc")
+        if self._disc_btn is not None:
+            self._disc_btn.destroy()
+            self._disc_btn = None
+
+    def _show_disconnected(self, title, text="", detail="", button=True):
+        """Экран вместо видео: телефон отключён или идёт переподключение."""
+        c = self.canvas
+        self._clear_disc()
+        c.delete("recframe")
+        c.itemconfigure(self.img_item, state="hidden")
+        c.itemconfigure(self.msg_item, text="")
+        cw, ch = self._csize()
+        cx, maxw = cw / 2, min(300, cw - 48)
+        tags = ("disc",)
+        items = []  # (высота, функция размещения по y)
+
+        def tile(y):
+            paint(c, 56, 56, box(0, 0, 56, 56, 16, C["panel"], C["line"])
+                  + icon_shapes("phone_off" if button else "refresh", 14, 14, 28, C["text2"]),
+                  tag=tags, x=cx - 28, y=y, clear=False)
+        items.append((56, tile))
+
+        def text_item(t, f, col, width=maxw):
+            it = c.create_text(cx, 0, text=t, anchor="n", fill=col, font=f, width=width, justify="center",
+                               tags=tags)
+            bb = c.bbox(it)
+            items.append((bb[3] - bb[1], lambda y: c.coords(it, cx, y)))
+
+        text_item(title, font(18, "semibold"), C["text"])
+        if text:
+            text_item(text, font(13), C["text2"])
+        if detail:
+            f = font(12, mono=True)
+            it = c.create_text(cx, 0, text=detail, anchor="n", fill=C["muted"], font=f, width=maxw - 20,
+                               justify="center", tags=tags)
+            bb = c.bbox(it)
+            bw, bh = bb[2] - bb[0] + 20, bb[3] - bb[1] + 16
+
+            def place(y, it=it, bw=bw, bh=bh):
+                c.coords(it, cx, y + 8)
+                paint(c, bw, bh, box(0, 0, bw, bh, 8, C["mono_bg"], C["elev"]), tag=("disc", "disc_bg"),
+                      x=cx - bw / 2, y=y, clear=False)
+                c.tag_lower("disc_bg", it)
+            items.append((bh, place))
+        if button:
+            self._disc_btn = Button(c, "Подключить снова", self.reconnect, kind="primary", icon="refresh",
+                                    height=40, radius=10, size=14, bg=C["video"])
+
+            def place_btn(y):
+                c.create_window(cx, y + 4, anchor="n", window=self._disc_btn, tags=tags)
+            items.append((44, place_btn))
+        gap = 16
+        total = sum(h for h, _ in items) + gap * (len(items) - 1)
+        y = max(16, (ch - total) / 2)
+        for h, place in items:
+            place(y)
+            y += h + gap
+        c.tag_raise("disc")
+
+    def reconnect(self, audio=None, note=None, max_size=None, encoder=None):
+        if self._closing or getattr(self, "_reconnecting", False):
+            return
+        self._reconnecting = True
+        self._clear_disc()
+        self.canvas.itemconfigure(self.msg_item, text="Подключение…")
+        old = self.link
+        new = old.clone(audio=audio, max_size=max_size, encoder=encoder)
+
+        def work():
+            old.stop()
+            try:
+                new.start()
+                err = None
+            except Exception as e:  # noqa
+                err = str(e).split("\n")[0]
+            self.after(0, lambda: done(err))
+
+        def done(err):
+            self._reconnecting = False
+            if self._closing:
+                threading.Thread(target=new.stop, daemon=True).start()
+                return
+            if err:
+                self._show_disconnected("Не удалось подключиться",
+                                        "Проверьте кабель и разрешение «Отладка по USB» на телефоне.", detail=err)
+                return
+            self.link = new
+            self.decoder = VideoDecoder()
+            if self.player and not new.audio:
+                self.player.close()
+                self.player = None
+            self.aconf = None
+            self.dev_size, self.img_rect, self.shown_seq = None, None, -1
+            self.ended, self.ended_handled = None, False
+            self.canvas.itemconfigure(self.img_item, state="normal")
+            self.canvas.itemconfigure(self.msg_item, text="Подключение…")
+            self.title(f"{new.device_name} — {self.app_name}")
+            if self.player is None and new.audio:
+                try:
+                    self.player = AudioPlayer()
+                except Exception:  # noqa
+                    self.player = None
+            self.audio_none = None
+            new.run(self._on_session, self._on_video, self._on_audio_config, self._on_audio, self._on_ended,
+                    self._on_audio_none)
+            if note:
+                self._toast(note)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _fit_window(self):
         """Окно ровно по пропорциям экрана телефона; растягивать вручную нельзя.
@@ -1360,6 +1484,9 @@ class DeviceWindow(tk.Toplevel):
         self.geometry(f"{vw}x{vh + TOP_H + BOT_H + 2}")
         self.canvas.coords(self.msg_item, vw / 2, vh / 2)
         self.shown_seq = -1 if self.shown_seq >= 0 else self.shown_seq
+        self.after_idle(self._draw_frame)
+        if self._save_info:
+            self.after_idle(lambda: self._save_card(self._save_info))
         self.after(50, self.group.arrange)
 
     def _show(self, frame):
@@ -1421,7 +1548,8 @@ class DeviceWindow(tk.Toplevel):
 
     def _press(self, e):
         self.canvas.focus_set()
-        if self._on_toast():
+        tags = self.canvas.gettags("current")
+        if self._on_toast() or "banner" in tags or "savecard" in tags or "disc" in tags:
             return
         p = self._to_device(e.x, e.y)
         if p and self.ended is None:
@@ -1454,7 +1582,8 @@ class DeviceWindow(tk.Toplevel):
         if code is not None:
             self.link.key(code)
         elif e.char and e.char.isprintable():
-            self.link.send(msg_text(e.char))
+            # scrcpy умеет «печатать» только ASCII; кириллицу и прочее вставляем через буфер обмена
+            self.link.send(msg_text(e.char) if e.char.isascii() else msg_paste(e.char))
 
     # --- запись (через группу)
     def stop_rec(self, then=None):
@@ -1496,8 +1625,8 @@ class DeviceWindow(tk.Toplevel):
         self._update_controls()
         self._toast("Звук на компьютере выключен" if self.player.muted else "Звук на компьютере включён")
 
-    def _toast(self, text, folder=None, sticky=False):
-        """Плашка внизу видео; со ссылкой на папку — кликабельная."""
+    def _toast(self, text, folder=None, sticky=False, action=None):
+        """Плашка внизу видео; со ссылкой на папку или действием — кликабельная."""
         if self._closing:
             return
         if self._toast_job:
@@ -1507,20 +1636,67 @@ class DeviceWindow(tk.Toplevel):
         c.delete("toast")
         if not text:
             return
-        cw = max(c.winfo_width(), int(c.cget("width")))
-        ch = max(c.winfo_height(), int(c.cget("height")))
-        t = c.create_text(cw / 2, ch - 34, text=text, fill="#F2F3F7", width=cw - 64, justify="center",
-                          font=("TkDefaultFont", 12, "underline" if folder else "normal"), tags=("toast",))
+        cw, ch = self._csize()
+        bottom = ch - 20
+        if self._save_info:  # не перекрывать карточку сохранения
+            bb = c.bbox("savecard")
+            if bb:
+                bottom = bb[1] - 12
+        link = bool(folder or action)
+        t = c.create_text(cw / 2, bottom - 10, text=text, fill="#F2F3F7", width=cw - 80, justify="center",
+                          anchor="s", font=font(13, underline=link), tags=("toast", "toast_fg"))
         x0, y0, x1, y1 = c.bbox(t)
-        bg = _rounded(c, x0 - 14, y0 - 8, x1 + 14, y1 + 8, 12, fill=C["toast"], outline="", tags=("toast",))
-        c.tag_lower(bg, t)
+        bw, bh = x1 - x0 + 28, y1 - y0 + 20
+        paint(c, bw, bh, box(0, 0, bw, bh, 12, C["toast"]), tag=("toast", "toast_bg"), x=x0 - 14, y=y0 - 10,
+              clear=False)
+        c.tag_lower("toast_bg", t)
         c.tag_unbind("toast", "<ButtonRelease-1>")
-        if folder:
-            c.tag_bind("toast", "<ButtonRelease-1>", lambda e: open_folder(folder))
+        if link:
+            c.tag_bind("toast", "<ButtonRelease-1>",
+                       lambda e: (c.delete("toast"), action()) if action else open_folder(folder))
             c.tag_bind("toast", "<Enter>", lambda e: c.configure(cursor="hand2"))
             c.tag_bind("toast", "<Leave>", lambda e: c.configure(cursor=""))
         if not sticky:
-            self._toast_job = self.after(4500 if folder else 2000, lambda: c.delete("toast"))
+            self._toast_job = self.after(9000 if action else (4500 if folder else 2200), lambda: c.delete("toast"))
+
+    def _save_card(self, info):
+        """Карточка внизу видео: что происходит с записью и сколько осталось."""
+        if self._closing:
+            return
+        c = self.canvas
+        c.delete("savecard")
+        self._save_info = dict(info) if info else None
+        if not info:
+            return
+        c.delete("toast")
+        cw, ch = self._csize()
+        x0, x1, pad = 16, cw - 16, 16
+        W, inner = x1 - x0, x1 - x0 - 2 * pad
+        frac = min(1.0, max(0.0, info.get("frac") or 0.0))
+        tags = ("savecard", "save_fg")
+        note = " · ".join(v for v in (info.get("file"), info.get("note")) if v)
+        nt = c.create_text(x0 + pad, 0, text=note, anchor="nw", fill=C["text2"], width=inner, font=font(12),
+                           tags=tags)
+        nb = c.bbox(nt)
+        nh = nb[3] - nb[1] if note else 0
+        H = pad + 20 + 12 + 6 + (12 + nh if note else 0) + pad
+        y0 = ch - 16 - H
+        paint(c, W, H, box(0, 0, W, H, 14, C["card"], C["card_line"]), tag=("savecard", "save_bg"),
+              x=x0, y=y0, clear=False)
+        pf = font(14, "semibold", mono=True)
+        pct = f"{int(frac * 100)}%"
+        c.create_text(x1 - pad, y0 + pad + 10, text=pct, anchor="e", fill=C["text"], font=pf, tags=tags)
+        tf = font(14, "semibold")
+        c.create_text(x0 + pad, y0 + pad + 10, anchor="w", fill=C["text"], font=tf, tags=tags,
+                      text=info.get("title") or "Сохраняю видео", width=inner - measure(pf, pct) - 12)
+        by = y0 + pad + 20 + 12
+        fill_w = round(inner * frac)
+        paint(c, inner, 6, box(0, 0, inner, 6, 3, C["hover"]) + (box(0, 0, max(6, fill_w), 6, 3, C["text"])
+                                                                if fill_w > 0 else []),
+              tag=tags, x=x0 + pad, y=by, clear=False)
+        c.coords(nt, x0 + pad, by + 6 + 12)
+        c.tag_lower("save_bg", "save_fg")
+        c.tag_raise("savecard")
 
     # --- закрытие
     def close(self):

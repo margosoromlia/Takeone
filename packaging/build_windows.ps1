@@ -48,7 +48,7 @@ python -m PyInstaller --noconfirm --clean --windowed --name Takeone `
     --icon "$Build\icon.ico" `
     --distpath "$Build\dist" --workpath "$Build\work" --specpath $Build `
     --add-data "${Bin};bin" `
-    --paths "$Root\app" --hidden-import android_view --collect-submodules av `
+    --paths "$Root\app" --hidden-import android_view --hidden-import ui_kit --collect-submodules av `
     "$Root\app\takeone.py"
 
 Write-Host "== Установщик"
