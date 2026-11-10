@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Force $Bin | Out-Null
 
 Write-Host "== Python-зависимости"
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pyinstaller imageio-ffmpeg pillow
+python -m pip install --quiet pyinstaller imageio-ffmpeg pillow av numpy sounddevice
 
 Write-Host "== scrcpy $Scrcpy (с adb)"
 $zip = Join-Path $Build "scrcpy.zip"
@@ -48,6 +48,7 @@ python -m PyInstaller --noconfirm --clean --windowed --name Takeone `
     --icon "$Build\icon.ico" `
     --distpath "$Build\dist" --workpath "$Build\work" --specpath $Build `
     --add-data "${Bin};bin" `
+    --paths "$Root\app" --hidden-import android_view --collect-submodules av `
     "$Root\app\takeone.py"
 
 Write-Host "== Установщик"

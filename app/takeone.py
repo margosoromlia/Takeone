@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP = "Takeone"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -124,10 +124,30 @@ def default_video_dir():
 
 
 # ----------------------------------------------------------------- Android
-def scrcpy_version(scrcpy):
-    out = run([scrcpy, "--version"]).stdout
-    m = re.search(r"scrcpy\s+v?(\d+)\.(\d+)", out)
-    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+SCRCPY_SERVER_VERSION = "5.0.1"  # должна совпадать с версией scrcpy в скриптах сборки
+
+
+def find_scrcpy_server():
+    """scrcpy-server и его версия: встроенный в сборку или от установленного scrcpy (запуск из исходников)."""
+    bundled = os.path.join(BIN, "scrcpy", "scrcpy-server")
+    if os.path.exists(bundled):
+        return bundled, SCRCPY_SERVER_VERSION
+    s = shutil.which("scrcpy")
+    if not s:
+        return None, None
+    m = re.search(r"scrcpy\s+v?(\d+\.\d+(?:\.\d+)?)", run([s, "--version"]).stdout)
+    ver = m.group(1) if m else None
+    real = os.path.dirname(os.path.realpath(s))
+    for c in (os.environ.get("SCRCPY_SERVER_PATH"), os.path.join(real, "scrcpy-server"),
+              os.path.join(real, "..", "share", "scrcpy", "scrcpy-server"),
+              "/usr/local/share/scrcpy/scrcpy-server", "/usr/share/scrcpy/scrcpy-server"):
+        if c and os.path.exists(c):
+            return os.path.abspath(c), ver
+    return None, ver
+
+
+def default_shots_dir():
+    return os.path.join(os.path.expanduser("~"), "Pictures", APP)
 
 
 def list_android():
@@ -147,130 +167,6 @@ def list_android():
             label += f"  — {state}"
         devs.append((serial, label))
     return devs
-
-
-class AndroidEngine:
-    """Окно трансляции — отдельный scrcpy. Запись — второй scrcpy без окна,
-    который пишет фрагменты .mkv. Пауза = закончить фрагмент, продолжить = начать новый.
-    При сохранении фрагменты склеиваются ffmpeg без перекодирования видео."""
-
-    def __init__(self, serial, max_size, bitrate, audio):
-        self.serial, self.max_size, self.bitrate, self.audio = serial, max_size, bitrate, audio
-        self.scrcpy = tool("scrcpy")
-        self.mirror = self.rec = None
-        self.tmpdir = None
-        self.segments = []
-        self._logs = []
-
-    def _common(self):
-        a = ["-s", self.serial, "--video-bit-rate", f"{self.bitrate}M"]
-        if self.max_size > 0:
-            a += ["--max-size", str(self.max_size)]
-        return a
-
-    def _log(self, name, mode="wb"):
-        f = open(os.path.join(LOG_DIR, name), mode)
-        self._logs.append(f)
-        return f
-
-    def connect(self):
-        if not self.scrcpy:
-            raise RuntimeError("scrcpy не найден. Установите его (см. README) и перезапустите программу.")
-        v = scrcpy_version(self.scrcpy)
-        if v < (2, 1):
-            raise RuntimeError(f"Нужен scrcpy 2.1 или новее (найден {v[0]}.{v[1]}).")
-        log = os.path.join(LOG_DIR, "android_mirror.log")
-        self.mirror = popen([self.scrcpy, *self._common(), "--no-audio", "--stay-awake",
-                             "--window-title", f"{APP} — {self.serial}"],
-                            stdout=DEVNULL, stderr=self._log("android_mirror.log"))
-        time.sleep(2.0)
-        if self.mirror.poll() is not None:
-            raise RuntimeError("Трансляция не запустилась. Проверьте, что включена «Отладка по USB» "
-                               "и на телефоне разрешён доступ для этого компьютера.\n\n" + tail(log))
-
-    def start(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="takeone_")
-        self.segments = []
-        self._new_segment()
-
-    def _new_segment(self):
-        path = os.path.join(self.tmpdir, f"part_{len(self.segments):03d}.mkv")
-        log = os.path.join(LOG_DIR, "android_record.log")
-        cmd = [self.scrcpy, *self._common(), "--no-playback", "--record", path]
-        if not self.audio:
-            cmd.append("--no-audio")
-        self.rec = popen(cmd, stdout=DEVNULL, stderr=self._log("android_record.log", "ab"))
-        self.segments.append(path)
-        t0 = time.time()
-        while time.time() - t0 < 10:  # ждём, пока реально пошла запись
-            if self.rec.poll() is not None:
-                raise RuntimeError("Запись не стартовала. Если устройство не тянет два видеопотока сразу, "
-                                   "уменьшите «Макс. сторону».\n\n" + tail(log))
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                return
-            time.sleep(0.1)
-
-    def pause(self):
-        stop_proc(self.rec)
-        self.rec = None
-
-    def resume(self):
-        self._new_segment()
-
-    def stop(self):
-        stop_proc(self.rec)
-        self.rec = None
-
-    def save(self, dest):
-        segs = [s for s in self.segments if os.path.exists(s) and os.path.getsize(s) > 1024]
-        if not segs:
-            raise RuntimeError("Запись пустая — нечего сохранять.")
-        ext = os.path.splitext(dest)[1].lower()
-        ff = tool("ffmpeg")
-        if not ff:
-            if len(segs) == 1:
-                dest = os.path.splitext(dest)[0] + ".mkv"
-                shutil.move(segs[0], dest)
-                self.cleanup()
-                return dest
-            raise RuntimeError("Для склейки фрагментов после паузы нужен ffmpeg (см. README). "
-                               f"Фрагменты лежат здесь:\n{self.tmpdir}")
-        lst = os.path.join(self.tmpdir, "list.txt")
-        with open(lst, "w", encoding="utf-8") as f:
-            for s in segs:
-                f.write("file '%s'\n" % s.replace("\\", "/").replace("'", "'\\''"))
-        cmd = [ff, "-y", "-hide_banner", "-loglevel", "error",
-               "-f", "concat", "-safe", "0", "-i", lst, "-map", "0", "-c", "copy"]
-        if ext in (".mp4", ".mov"):
-            cmd += ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]
-        cmd.append(dest)
-        r = run(cmd, timeout=3600)
-        if r.returncode:
-            raise RuntimeError("ffmpeg не смог собрать файл:\n" + r.stderr[-1500:] +
-                               f"\n\nФрагменты сохранены в:\n{self.tmpdir}")
-        self.cleanup()
-        return dest
-
-    def cleanup(self):
-        if self.tmpdir:
-            shutil.rmtree(self.tmpdir, ignore_errors=True)
-            self.tmpdir = None
-
-    def disconnect(self):
-        stop_proc(self.rec)
-        stop_proc(self.mirror)
-        self.rec = self.mirror = None
-        for f in self._logs:
-            try:
-                f.close()
-            except Exception:
-                pass
-
-    def alive(self):
-        return self.mirror is not None and self.mirror.poll() is None
-
-    def rec_alive(self):
-        return self.rec is not None and self.rec.poll() is None
 
 
 # ----------------------------------------------------------------- iOS (macOS)
@@ -632,6 +528,7 @@ class App:
         root.title(f"{APP} {VERSION}")
         root.resizable(False, False)
         self.engine = None
+        self.android_win = None
         self.state = "idle"  # idle | connected | recording | paused
         self.busy = False
         self.devices = []
@@ -698,15 +595,15 @@ class App:
         for i, b in enumerate((self.btn_conn, self.btn_rec, self.btn_pause, self.btn_stop)):
             b.grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
 
-        tf = ttk.Frame(f)
+        self.timer_row = tf = ttk.Frame(f)
         tf.grid(row=4, column=0, columnspan=3, sticky="we", pady=(10, 0))
         self.dot = tk.Label(tf, text="●", fg="gray", font=("TkDefaultFont", 16))
         self.dot.pack(side="left")
         ttk.Label(tf, textvariable=self.timer, font=("TkFixedFont", 20)).pack(side="left", padx=6)
         ttk.Label(f, textvariable=self.status, wraplength=470, foreground="#555").grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(f, text="Горячие клавиши (в этом окне): Ctrl+R — запись, Ctrl+P — пауза, Ctrl+S — стоп",
-                  foreground="#888").grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.hint = ttk.Label(f, text="", foreground="#888", wraplength=470)
+        self.hint.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         root.bind("<Control-r>", lambda e: self.start_rec())
         root.bind("<Control-p>", lambda e: self.toggle_pause())
@@ -750,14 +647,23 @@ class App:
         en(self.btn_refresh, not b and s == "idle")
         en(self.dev_cb, not b and s == "idle")
         self.dev_cb.configure(state="readonly" if (not b and s == "idle") else "disabled")
+        plat = self.platform.get()
+        android = plat == "Android"
         en(self.btn_conn, not b and s in ("idle", "connected"))
-        self.btn_conn.configure(text="Отключить" if s != "idle" else "Подключить")
+        self.btn_conn.configure(text="Открыть трансляцию" if android else
+                                ("Отключить" if s != "idle" else "Подключить"),
+                                width=20 if android else 13)
+        for w in (self.btn_rec, self.btn_pause, self.btn_stop):
+            (w.grid_remove if android else w.grid)()
+        (self.timer_row.grid_remove if android else self.timer_row.grid)()
+        self.hint.configure(text="Запись, пауза, звук и скриншоты — на панели вверху окна телефона."
+                            if android else
+                            "Горячие клавиши (в этом окне): Ctrl+R — запись, Ctrl+P — пауза, Ctrl+S — стоп")
         en(self.btn_rec, not b and s in ("idle", "connected") and bool(self.devices))
         en(self.btn_pause, not b and s in ("recording", "paused"))
         self.btn_pause.configure(text="▶ Продолжить" if s == "paused" else "⏸ Пауза")
         en(self.btn_stop, not b and s in ("recording", "paused"))
         self.dot.configure(fg={"recording": "red", "paused": "orange", "connected": "green"}.get(s, "gray"))
-        plat = self.platform.get()
         (self.opts.grid if plat == "Android" else self.opts.grid_remove)()
         (self.ap_opts.grid if plat == "AirPlay" else self.ap_opts.grid_remove)()
 
@@ -784,7 +690,7 @@ class App:
                 self.status.set("Нажмите «Подключить», затем на iPhone включите «Повтор экрана».")
             elif devs:
                 self.dev_cb.current(0)
-                self.status.set(f"Найдено устройств: {len(devs)}. Нажмите «Подключить» или «Запись».")
+                self.status.set(f"Найдено устройств: {len(devs)}. Нажмите «" + ("Открыть трансляцию" if plat == "Android" else "Подключить") + "».")
             else:
                 self.device.set("")
                 self.status.set("Устройства не найдены. " + (
@@ -808,15 +714,60 @@ class App:
         if self.platform.get() == "AirPlay":
             self.ap_hint = None
             return AirPlayEngine(self.ap_name.get())
+        raise RuntimeError("Android открывается в своём окне трансляции.")
+
+    # --- Android: отдельное окно трансляции с панелью записи
+    def open_android(self):
+        if self.busy or self.android_win is not None:
+            return
+        idx = self.dev_cb.current()
+        if idx < 0:
+            messagebox.showwarning(APP, "Выберите устройство.")
+            return
+        serial = self.devices[idx][0]
         try:
             ms = int(self.max_size.get() or 0)
-            br = max(1, int(float(self.bitrate.get() or 8)))
+            br = max(1.0, float(self.bitrate.get() or 8))
         except ValueError:
-            raise RuntimeError("Проверьте числа в настройках Android.")
-        return AndroidEngine(uid, ms, br, self.audio.get())
+            messagebox.showwarning(APP, "Проверьте числа в настройках Android.")
+            return
+        server, ver = find_scrcpy_server()
+        if not server:
+            messagebox.showerror(APP, "Не найден scrcpy-server. Переустановите Takeone.")
+            return
+        if not ver or int(ver.split(".")[0]) < 5:
+            messagebox.showerror(APP, f"Нужен scrcpy 5.x (найден {ver or 'неизвестной версии'}).")
+            return
+        try:
+            import android_view
+        except ImportError as e:
+            messagebox.showerror(APP, f"Не хватает компонента для трансляции: {e}\n"
+                                      "Установите: pip install av pillow numpy sounddevice")
+            return
+        link = android_view.AndroidLink(tool("adb"), serial, server, ver, ms, br, self.audio.get(), LOG_DIR)
+
+        def done(_):
+            self.android_win = android_view.DeviceWindow(
+                self.root, link, tool("ffmpeg"), default_shots_dir(), default_video_dir(), None,
+                self._android_closed, APP)
+            self.state = "connected"
+            self.status.set("Трансляция открыта в отдельном окне.")
+            self.root.withdraw()
+
+        self.bg(link.start, done, link.stop, "Подключаюсь к телефону…")
+
+    def _android_closed(self):
+        self.android_win = None
+        self.state = "idle"
+        self.status.set("Трансляция закрыта.")
+        self.root.deiconify()
+        self.update_buttons()
 
     # --- подключение
     def toggle_connect(self):
+        if self.platform.get() == "Android":
+            self.open_android()
+            return
         if self.state == "idle":
             try:
                 eng = self.make_engine()
@@ -840,7 +791,7 @@ class App:
 
     # --- запись
     def start_rec(self):
-        if self.busy or self.state not in ("idle", "connected"):
+        if self.busy or self.state not in ("idle", "connected") or self.platform.get() == "Android":
             return
         if self.state == "idle":
             try:
@@ -897,9 +848,8 @@ class App:
             dest = filedialog.asksaveasfilename(
                 title="Сохранить запись", initialdir=default_video_dir(), initialfile=name,
                 defaultextension=".mp4",
-                filetypes=[("MP4", "*.mp4"), ("QuickTime MOV" if ios else "Matroska MKV",
-                                              "*.mov" if ios else "*.mkv")] if ios or isinstance(
-                    self.engine, AndroidEngine) else [("MP4", "*.mp4"), ("Matroska MKV", "*.mkv")])
+                filetypes=[("MP4", "*.mp4"), ("QuickTime MOV", "*.mov")] if ios
+                else [("MP4", "*.mp4"), ("Matroska MKV", "*.mkv")])
             if dest:
                 break
             if messagebox.askyesno(APP, "Удалить эту запись без сохранения?"):
@@ -945,6 +895,9 @@ class App:
 
     def on_close(self):
         if self.busy:
+            return
+        if self.android_win is not None:
+            self.android_win.close()
             return
         if self.state in ("recording", "paused"):
             ans = messagebox.askyesnocancel(APP, "Идёт запись. Сохранить её перед выходом?")

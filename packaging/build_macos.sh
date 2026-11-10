@@ -26,7 +26,7 @@ mkdir -p "$BIN/scrcpy" "$BIN/ffmpeg"
 
 echo "== Python-зависимости"
 "$PY" -m pip install --quiet --upgrade pip
-"$PY" -m pip install --quiet pyinstaller imageio-ffmpeg pillow
+"$PY" -m pip install --quiet pyinstaller imageio-ffmpeg pillow av numpy sounddevice
 "$PY" -c "import tkinter" || { echo "у этого Python нет tkinter — поставьте Python с python.org" >&2; exit 1; }
 
 echo "== scrcpy $SCRCPY (с adb)"
@@ -56,6 +56,7 @@ echo "== PyInstaller"
   --icon "$BUILD/icon.icns" --osx-bundle-identifier app.takeone \
   --distpath "$BUILD/dist" --workpath "$BUILD/work" --specpath "$BUILD" \
   --add-data "$BIN:bin" \
+  --paths "$ROOT/app" --hidden-import android_view --collect-submodules av \
   "$ROOT/app/takeone.py"
 
 APPDIR="$BUILD/dist/Takeone.app"
@@ -65,7 +66,9 @@ plutil -replace NSCameraUsageDescription -string "Takeone показывает �
 plutil -replace NSMicrophoneUsageDescription -string "Takeone записывает звук iPhone/iPad, подключённого по USB." "$PLIST"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
 plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
-plutil -replace LSMinimumSystemVersion -string "11.0" "$PLIST"
+# PyAV для Apple Silicon собран под macOS 14+, для Intel — под 11+
+if [ "$ARCH" = arm64 ]; then MINOS=14.0; else MINOS=11.0; fi
+plutil -replace LSMinimumSystemVersion -string "$MINOS" "$PLIST"
 codesign --force --deep --sign - "$APPDIR"
 codesign --verify --deep "$APPDIR"
 
@@ -75,6 +78,11 @@ mkdir -p "$STAGE"
 cp -R "$APPDIR" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 DMG="$BUILD/Takeone-$VERSION-macOS-$ARCH.dmg"
-hdiutil create -volname "Takeone" -srcfolder "$STAGE" -ov -format UDZO "$DMG" > /dev/null
+# На серверах GitHub hdiutil иногда случайно падает с «Resource busy» — пробуем несколько раз
+for i in 1 2 3 4 5; do
+  if hdiutil create -volname "Takeone" -srcfolder "$STAGE" -ov -format UDZO "$DMG" > /dev/null; then break; fi
+  [ "$i" = 5 ] && { echo "не удалось создать DMG" >&2; exit 1; }
+  echo "hdiutil занят, повтор через 10 с ($i/5)…"; sleep 10
+done
 
 echo "== Готово: $DMG"
