@@ -132,6 +132,15 @@ ICONS = {
               ("circle", 12, 16.8, 1.15, None)],
     "close": [("line", [(6.5, 6.5), (17.5, 17.5)], 2), ("line", [(17.5, 6.5), (6.5, 17.5)], 2)],
     "check": [("line", [(5, 12.5), (9.5, 17), (19, 7)], 2.6)],
+    "scissors": [("circle", 6.5, 6.5, 3, 2), ("circle", 6.5, 17.5, 3, 2), ("line", [(9, 8.3), (20, 17)], 2),
+                 ("line", [(9, 15.7), (20, 7)], 2)],
+    "folder": [("line", [(3, 7), (3, 18.5), (21, 18.5), (21, 8.5), (12, 8.5), (10, 5.5), (3, 5.5), (3, 7)], 2)],
+    "film": [("rrect", 3, 4, 21, 20, 2.5, 1.8), ("line", [(7.5, 4), (7.5, 20)], 1.6),
+             ("line", [(16.5, 4), (16.5, 20)], 1.6), ("line", [(3, 12), (7.5, 12)], 1.6),
+             ("line", [(16.5, 12), (21, 12)], 1.6)],
+    "mark_in": [("line", [(10, 4), (6, 4), (6, 20), (10, 20)], 2.2), ("poly", [(11, 8), (18, 12), (11, 16)])],
+    "mark_out": [("line", [(14, 4), (18, 4), (18, 20), (14, 20)], 2.2), ("poly", [(13, 8), (6, 12), (13, 16)])],
+    "undo": [("arc", 13, 13, 7, 270, 230, 2), ("line", [(4.5, 6), (5.5, 11), (10.5, 9.8)], 2)],
 }
 
 
@@ -396,7 +405,7 @@ class IconButton(_Canvas):
         else:
             color = C["dim"]
         shapes = box(0, 0, s, s, 9, fill) + icon_shapes(self.icon, (s - g) / 2, (s - g) / 2, g, color)
-        self.configure(cursor="hand2" if self.enabled else "")
+        self.configure(cursor="")
         paint(self, s, s, shapes)
 
     def _release(self, e):
@@ -465,7 +474,7 @@ class RecPill(_Canvas):
         paint(self, W, H, box(0, 0, W, H, H / 2, bg) + icon)
         self.delete("txt")
         self.create_text(tx, cy, text=self.text, anchor="w", fill=fg, tags=("txt",), font=self._font())
-        self.configure(cursor="hand2" if self.clickable() else "")
+        self.configure(cursor="")
 
 
 class Button(_Canvas):
@@ -536,7 +545,7 @@ class Button(_Canvas):
         paint(self, w, h, shapes)
         self.delete("txt")
         self.create_text(x, h / 2, text=self.text, anchor="w", fill=fg, font=self._font(), tags=("txt",))
-        self.configure(cursor="hand2" if self.enabled else "")
+        self.configure(cursor="")
 
     def _release(self, e):
         self._set(pressed=False)
@@ -570,6 +579,12 @@ class Segmented(_Canvas):
     def set_enabled(self, on):
         if on != self.enabled:
             self.enabled = on
+            self._draw()
+
+    def set_disabled(self, tips):
+        """Недоступные сейчас вкладки: {значение: подсказка}."""
+        if tips != self.tips or set(tips) != self.disabled:
+            self.tips, self.disabled = dict(tips), set(tips)
             self._draw()
 
     def _segments(self):
@@ -622,9 +637,7 @@ class Segmented(_Canvas):
             f = font(self.fs, "semibold" if sel else "normal")
             self.create_text((x0 + x1) / 2, h / 2, text=ellipsize(f, text, x1 - x0 - 8), fill=fg, font=f,
                              tags=("txt",))
-        hv = self.hover
-        ok = self.enabled and hv is not None and hv not in self.disabled and hv != cur
-        self.configure(cursor="hand2" if ok else "")
+        self.configure(cursor="")
 
 
 class Toggle(_Canvas):
@@ -660,7 +673,7 @@ class Toggle(_Canvas):
             track, knob = C["field_line"], C["muted"]
         kx = W - 3 - 9 if on else 3 + 9
         paint(self, W, H, box(0, 0, W, H, H / 2, track) + [("circle", kx, H / 2, 9, knob, None)])
-        self.configure(cursor="hand2" if self.enabled else "")
+        self.configure(cursor="")
 
 
 class Field(_Canvas):
@@ -774,7 +787,7 @@ class DeviceRow(_Canvas):
             kind, text = self.status
             cf = font(12)
             chip_w = measure(cf, text) + 14
-            dot = {"ok": C["ok"], "wait": C["amber"]}.get(kind, C["dim"])
+            dot = {"ok": C["ok"], "wait": C["amber"], "live": C["text"]}.get(kind, C["dim"])
             shapes.append(("circle", w - 12 - chip_w + 4, cy, 4, dot, None))
         paint(self, w, h, shapes)
         self.delete("txt")
@@ -787,9 +800,9 @@ class DeviceRow(_Canvas):
                          fill=C["muted"], tags=("txt",))
         if self.status:
             kind, text = self.status
-            col = {"ok": C["ok_text"], "wait": C["amber_text"]}.get(kind, C["muted"])
+            col = {"ok": C["ok_text"], "wait": C["amber_text"], "live": C["text2"]}.get(kind, C["muted"])
             self.create_text(w - 12, cy, text=text, anchor="e", font=font(12), fill=col, tags=("txt",))
-        self.configure(cursor="hand2" if self.enabled else "")
+        self.configure(cursor="")
 
 
 class LogoTile(_Canvas):

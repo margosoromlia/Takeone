@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -140,6 +140,8 @@ class AndroidLink:
         safe = "".join(ch if ch.isalnum() else "_" for ch in serial)
         self.log = os.path.join(log_dir, f"android_server_{safe}.log")  # у каждого телефона свой лог
         self.started_at = None
+        self.vpackets = 0      # сколько видеопакетов пришло (для диагностики «нет картинки»)
+        self.vsize = None
         self.proc = None
         self.port = None
         self.video = self.audio_sock = self.control = None
@@ -231,6 +233,14 @@ class AndroidLink:
     def log_text(self):
         return _tail(self.log, 20000)
 
+    def note(self, text):
+        """Наша пометка в лог телефона — чтобы по логу было видно, что происходило на компьютере."""
+        try:
+            with open(self.log, "ab") as f:
+                f.write(f"[takeone] {time.strftime('%H:%M:%S')} {text}\n".encode("utf-8"))
+        except OSError:
+            pass
+
     def error_hint(self):
         """Последняя ошибка, которую сервер на телефоне написал в лог."""
         lines = [ln.strip() for ln in _tail(self.log, 6000).splitlines()]
@@ -316,10 +326,12 @@ class AndroidLink:
                 hdr = recv_exact(self.video, 12)
                 if hdr[0] & 0x80:  # метаданные сессии: новый размер кадра
                     _, w, h = struct.unpack(">III", hdr)
+                    self.vsize = (w, h)
                     self._safe("session", w, h)
                     continue
                 ptsf, size = struct.unpack(">QI", hdr)
                 data = recv_exact(self.video, size)
+                self.vpackets += 1
                 if ptsf & FLAG_CONFIG:
                     config = pending = data
                     continue
@@ -705,9 +717,9 @@ class Recorder:
 
 
 # --- сохранение: перепаковка, сжатие до лимита, склейка нескольких телефонов ---------------
-def _run(cmd):
+def _run(cmd, timeout=None):
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          creationflags=NOWIN)
+                          creationflags=NOWIN, timeout=timeout)
 
 
 def probe(ffmpeg, path):
@@ -754,26 +766,111 @@ def height_for_bitrate(vb_per_stream, h):
     return min(h, 720)
 
 
+_HW = None
+HW_MIN_BITRATE = 2_500_000  # ниже этого аппаратный кодировщик заметно мылит — тогда x264
+
+
+def hw_encoder(ffmpeg):
+    """Аппаратный кодировщик H.264, который реально работает на этом компьютере ("" — нет такого).
+    Mac: VideoToolbox; Windows: NVIDIA, Intel, AMD или Media Foundation. Проверяется один раз."""
+    global _HW
+    if _HW is not None:
+        return _HW
+    _HW = ""
+    cands = ["h264_videotoolbox"] if IS_MAC else (["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf"] if IS_WIN else [])
+    try:
+        listed = _run([ffmpeg, "-hide_banner", "-encoders"], timeout=20).stdout
+    except Exception:  # noqa
+        return _HW
+    for enc in cands:
+        if enc not in listed:
+            continue
+        try:
+            r = _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "testsrc2=s=640x360:r=30:d=0.5", "-c:v", enc, "-b:v", "2M", "-f", "null", "-"], timeout=20)
+        except Exception:  # noqa
+            continue
+        if r.returncode == 0:
+            _HW = enc
+            break
+    return _HW
+
+
+def _hw_args(enc, vb):
+    rate = ["-b:v", str(vb)]
+    if enc == "h264_nvenc":
+        return ["-c:v", enc, "-preset", "p4", "-rc", "vbr"] + rate + ["-maxrate", str(int(vb * 1.3)),
+                                                                       "-bufsize", str(vb * 2)]
+    if enc == "h264_amf":
+        return ["-c:v", enc, "-rc", "vbr_peak"] + rate + ["-maxrate", str(int(vb * 1.3))]
+    if enc == "h264_qsv":
+        return ["-c:v", enc] + rate + ["-maxrate", str(int(vb * 1.3))]
+    return ["-c:v", enc] + rate
+
+
 def encode(ffmpeg, in_args, filt, dest, duration, limit_mb, audio, progress, tmpdir):
-    """Перекодирование в H.264: без лимита — по качеству (CRF), с лимитом — в два прохода под размер."""
-    base = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"] + in_args + filt
+    """Перекодирование в H.264 за один проход.
+    Быстрый путь — аппаратный кодировщик (видеокарта/чип), если бюджет битрейта позволяет;
+    иначе x264 с ограниченным CRF: качество по CRF, но не больше битрейта под лимит.
+    Если быстрый путь не сработал или файл вышел больше лимита — повтор на x264."""
     out_opts = ["-movflags", "+faststart"] if dest.lower().endswith((".mp4", ".mov")) else []
     aud = ["-c:a", "aac", "-b:a", "128k"] if audio else ["-an"]
+    vb = target_bitrate(limit_mb, duration, 128 if audio else 0) if limit_mb else 10_000_000
+    hw = hw_encoder(ffmpeg) if vb >= HW_MIN_BITRATE else ""
+
+    def cmd(video, hwaccel):
+        ins = []
+        for a in in_args:  # -hwaccel auto перед каждым входом: декодирование тоже на видеокарте
+            if a == "-i" and hwaccel:
+                ins += ["-hwaccel", "auto"]
+            ins.append(a)
+        return [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"] + ins + filt + video + aud + out_opts + [dest]
+
+    def fits():
+        return not limit_mb or os.path.getsize(dest) <= limit_mb * 1_000_000
+
+    if hw:
+        try:
+            run_ffmpeg(cmd(_hw_args(hw, int(vb * 0.92)), True), duration, progress)
+            if fits():
+                return
+        except RuntimeError:
+            pass
+        if progress:
+            progress(0.0)
     x264 = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
     if not limit_mb:
-        run_ffmpeg(base + x264 + ["-crf", "20"] + aud + out_opts + [dest], duration, progress)
+        run_ffmpeg(cmd(x264 + ["-crf", "20"], False), duration, progress)
         return
-    vb = target_bitrate(limit_mb, duration, 128 if audio else 0)
-    log = os.path.join(tmpdir, "x264pass")
-    for attempt in range(2):
-        rate = ["-b:v", str(vb), "-maxrate", str(int(vb * 1.5)), "-bufsize", str(int(vb * 2))]
-        run_ffmpeg(base + x264 + rate + ["-pass", "1", "-passlogfile", log, "-an", "-f", "null", "-"],
-                   duration, progress, (0.0, 0.45))
-        run_ffmpeg(base + x264 + rate + ["-pass", "2", "-passlogfile", log] + aud + out_opts + [dest],
-                   duration, progress, (0.45, 1.0))
-        if os.path.getsize(dest) <= limit_mb * 1_000_000:
+    for _ in range(3):
+        run_ffmpeg(cmd(x264 + ["-crf", "21", "-maxrate", str(vb), "-bufsize", str(vb)], False), duration, progress)
+        if fits():
             return
         vb = int(vb * 0.85)
+        if progress:
+            progress(0.0)
+
+
+LAST_VIDEO_FILE = os.path.join(os.path.expanduser("~"), ".takeone", "last_video.txt")
+
+
+def remember_video(path):
+    """Запомнить последнее сохранённое видео — для кнопки «Последняя запись» во вкладке «Монтаж»."""
+    try:
+        os.makedirs(os.path.dirname(LAST_VIDEO_FILE), exist_ok=True)
+        with open(LAST_VIDEO_FILE, "w", encoding="utf-8") as f:
+            f.write(path)
+    except OSError:
+        pass
+
+
+def last_video():
+    try:
+        with open(LAST_VIDEO_FILE, encoding="utf-8") as f:
+            p = f.read().strip()
+        return p if p and os.path.isfile(p) else None
+    except OSError:
+        return None
 
 
 def fmt_mb(v):
@@ -808,10 +905,43 @@ def fit_file(ffmpeg, src, dest, limit_mb, progress, tmpdir):
     vb = target_bitrate(limit_mb, dur, 128 if has_audio else 0)
     portrait_h = max(w, h)
     target = height_for_bitrate(vb, portrait_h)
-    vf = []
+    chain = []
+    if vb < 3_000_000:
+        chain.append("fps=30")  # мало битов — лучше 30 чётких кадров в секунду, чем 60 мыльных
     if target < portrait_h:
-        vf = ["-vf", (f"scale=-2:{target}" if h >= w else f"scale={target}:-2") + ":flags=lanczos"]
+        chain.append((f"scale=-2:{target}" if h >= w else f"scale={target}:-2") + ":flags=bicubic")
+    vf = ["-vf", ",".join(chain)] if chain else []
     encode(ffmpeg, ["-i", src], vf, dest, dur, limit_mb, has_audio, progress, tmpdir)
+
+
+def export_cut(ffmpeg, src, dest, segments, limit_mb, progress, tmpdir):
+    """Монтаж: склеить куски [(начало, конец), …] исходного видео в один файл.
+    Каждый кусок читается с точной перемоткой (-ss перед -i при перекодировании — с точностью до кадра),
+    затем concat; если задан лимит — сжатие под него, как при обычном сохранении."""
+    _, w, h = probe(ffmpeg, src)
+    has_audio = "Audio:" in _run([ffmpeg, "-hide_banner", "-i", src]).stderr
+    segments = [(a, b) for a, b in segments if b - a > 0.02]
+    if not segments:
+        raise RuntimeError("Нечего сохранять: всё видео вырезано.")
+    total = sum(b - a for a, b in segments)
+    ins = []
+    for a, b in segments:
+        ins += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", src]
+    chain = []
+    if limit_mb:
+        vb = target_bitrate(limit_mb, total, 128 if has_audio else 0)
+        if vb < 3_000_000:
+            chain.append("fps=30")
+        portrait_h = max(w, h)
+        target = height_for_bitrate(vb, portrait_h)
+        if portrait_h and target < portrait_h:
+            chain.append((f"scale=-2:{target}" if h >= w else f"scale={target}:-2") + ":flags=bicubic")
+    k = len(segments)
+    inputs = "".join(f"[{i}:v]" + (f"[{i}:a]" if has_audio else "") for i in range(k))
+    graph = f"{inputs}concat=n={k}:v=1:a={1 if has_audio else 0}[vc]" + ("[a]" if has_audio else "")
+    graph += f";[vc]{','.join(chain) or 'null'}[v]"
+    filt = ["-filter_complex", graph, "-map", "[v]"] + (["-map", "[a]"] if has_audio else [])
+    encode(ffmpeg, ins, filt, dest, total, limit_mb, has_audio, progress, tmpdir)
 
 
 def save_combined(ffmpeg, paths, sizes, dest, duration, limit_mb, progress, tmpdir):
@@ -825,7 +955,7 @@ def save_combined(ffmpeg, paths, sizes, dest, duration, limit_mb, progress, tmpd
     gap = max(8, h // 120) & ~1
     parts = []
     for i in range(n):
-        f = f"[{i}:v]fps=30,scale=-2:{h}:flags=lanczos,setsar=1"
+        f = f"[{i}:v]fps=30,scale=-2:{h}:flags=bicubic,setsar=1"
         if i < n - 1:
             f += f",pad=iw+{gap}:ih:0:0:color=black"
         parts.append(f + f"[v{i}]")
@@ -860,6 +990,55 @@ def open_folder(path):
         pass
 
 
+# --- раскладка окон телефонов -----------------------------------------------------------
+class WindowLayout:
+    """Все открытые окна телефонов (и общей, и раздельной записи) — чтобы ставить их рядом."""
+
+    def __init__(self):
+        self.windows = []
+        self.arranged = False
+
+    def add(self, w):
+        self.windows.append(w)
+        self.arranged = False
+
+    def remove(self, w):
+        if w in self.windows:
+            self.windows.remove(w)
+
+    def arrange(self):
+        """Окна телефонов — рядом друг с другом; если главное окно открыто — справа от него,
+        чтобы оно оставалось под рукой (можно добавить ещё телефон)."""
+        ws = self.windows
+        if self.arranged or not ws or not all(w.sized_for for w in ws):
+            return
+        main = ws[0].master
+        main_shown = False
+        try:
+            main_shown = bool(main.winfo_viewable())
+        except tk.TclError:
+            pass
+        if len(ws) < 2 and not main_shown:
+            return
+        self.arranged = True
+        for w in ws:
+            w.update_idletasks()
+        widths = [w.winfo_width() for w in ws]
+        gap = 14
+        total = sum(widths) + gap * (len(ws) - 1)
+        sw = ws[0].winfo_screenwidth()
+        x = max(0, (sw - total) // 2)
+        if main_shown:
+            right = main.winfo_rootx() + main.winfo_width() + gap
+            if right + total <= sw:
+                x = right
+            elif total + main.winfo_width() + gap <= sw:
+                x = sw - total  # не влезает справа от главного окна — прижать к правому краю
+        for w, wd in zip(ws, widths):
+            w.geometry(f"+{x}+30")
+            x += wd + gap
+
+
 # --- запись одного или нескольких окон ---------------------------------------------------
 class RecordGroup:
     """Управляет записью для одного окна или для нескольких связанных окон (общая запись)."""
@@ -867,12 +1046,14 @@ class RecordGroup:
     def __init__(self, ffmpeg, video_dir, tmp_root, limit_mb, app_name):
         self.ffmpeg, self.video_dir, self.tmp_root = ffmpeg, video_dir, tmp_root
         self.limit_mb, self.app_name = limit_mb, app_name
+        if _HW is None and ffmpeg:  # заранее узнать, есть ли аппаратный кодировщик, чтобы не ждать при сохранении
+            threading.Thread(target=hw_encoder, args=(ffmpeg,), daemon=True).start()
         self.members = []
         self.state = "idle"  # idle | recording | paused | saving
         self.elapsed, self.since = 0.0, None
         self.timeline = None
         self.tmp = None
-        self.arranged = False
+        self.layout = WindowLayout()  # раскладка по умолчанию, если окну не дали общую
         self.multi_rec = False
 
     @property
@@ -904,22 +1085,6 @@ class RecordGroup:
     def ready(self):
         alive = self.alive()
         return bool(alive) and all(w.ready() for w in alive)
-
-    def arrange(self):
-        """Окна нескольких телефонов — рядом по центру экрана (один раз)."""
-        if self.arranged or not self.multi or not all(w.sized_for for w in self.members):
-            return
-        self.arranged = True
-        ws = self.members
-        for w in ws:
-            w.update_idletasks()
-        widths = [w.winfo_width() for w in ws]
-        gap = 14
-        total = sum(widths) + gap * (len(ws) - 1)
-        x = max(0, (ws[0].winfo_screenwidth() - total) // 2)
-        for w, wd in zip(ws, widths):
-            w.geometry(f"+{x}+30")
-            x += wd + gap
 
     # --- кнопки
     def start(self):
@@ -993,17 +1158,26 @@ class RecordGroup:
             self._done("Запись пустая — нечего сохранять")
             return then and then()
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        name = f"{self.app_name}_{'вместе_' if self.multi_rec else ''}{stamp}"
-        while True:
-            dest = filedialog.asksaveasfilename(
-                parent=parent, title="Сохранить запись", initialdir=self.video_dir, initialfile=name,
-                defaultextension=".mp4", filetypes=[("MP4", "*.mp4"), ("Matroska MKV", "*.mkv")])
-            if dest:
-                break
-            if messagebox.askyesno(self.app_name, "Удалить эту запись без сохранения?", parent=parent):
-                shutil.rmtree(self.tmp, ignore_errors=True)
-                self._done("Запись удалена")
-                return then and then()
+        if self.multi_rec:
+            name = f"{self.app_name}_вместе_{stamp}"
+        else:
+            ln = self.members[0].link if self.members else None
+            model = ((ln.props.get("model") or ln.device_name) if ln else "") or ""
+            model = "".join(ch if ch.isalnum() or ch in "-" else "_" for ch in model).strip("_")[:30]
+            name = f"{self.app_name}_{model + '_' if model else ''}{stamp}"
+        import save_dialog
+        folder = save_dialog.last_dir(self.video_dir)
+        ext = save_dialog.load_prefs().get("ext_android", "mp4")
+        who = (f"{len(files)} {plural(len(files), 'телефон', 'телефона', 'телефонов')} вместе, без звука"
+               if self.multi_rec else (self.members[0].link.props.get("model") or self.members[0].link.device_name
+                                       if self.members else ""))
+        res, dest = save_dialog.ask(parent, self.app_name, save_dialog.unique_name(folder, name, ext),
+                                    kind="android", folder=folder,
+                                    info=" · ".join(v for v in (f"Длительность {fmt_hms(duration)}", who) if v))
+        if res != "save":
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            self._done("Запись удалена")
+            return then and then()
         tmp, multi, limit = self.tmp, self.multi_rec, self.limit_mb
         anchor = parent
         fname = os.path.basename(dest)
@@ -1048,6 +1222,7 @@ class RecordGroup:
                 self._done("Ошибка сохранения")
             else:
                 mb = os.path.getsize(dest) / 1_000_000
+                remember_video(dest)
                 self._done(f"Сохранено: {os.path.basename(dest)} · {mb:.1f} МБ", folder=os.path.dirname(dest))
             if then:
                 then()
@@ -1071,10 +1246,17 @@ class RecordGroup:
 
 # --- окно телефона -------------------------------------------------------------------------
 class DeviceWindow(tk.Toplevel):
-    def __init__(self, master, link, group, shots_dir, on_closed, size_frac=0.86, app_name="Takeone"):
+    def __init__(self, master, link, group, shots_dir, on_closed, size_frac=0.86, app_name="Takeone",
+                 layout=None, sharp=True):
         super().__init__(master, bg=C["video"])
         self.link, self.group, self.shots_dir = link, group, shots_dir
         self.on_closed, self.size_frac, self.app_name = on_closed, size_frac, app_name
+        self.layout = layout or group.layout
+        self.layout.add(self)
+        self.sharp = sharp and IS_MAC  # чёткий показ через Core Animation (только Mac)
+        self.native = None
+        self.native_tried = False
+        self._ov_rects = {}
         group.add(self)
         self.title(f"{link.device_name} — {app_name}")
         self.resizable(False, False)
@@ -1106,6 +1288,7 @@ class DeviceWindow(tk.Toplevel):
         self.video_retries = 0
         self.audio_none = None
         self.input_warned = False
+        self.got_frame = self.noframe_warned = self.noframe_shown = False
         link.run(self._on_session, self._on_video, self._on_audio_config, self._on_audio, self._on_ended,
                  self._on_audio_none)
         self.after(10, self._tick)
@@ -1122,7 +1305,7 @@ class DeviceWindow(tk.Toplevel):
         left.pack(side="left", padx=(10, 0), pady=(TOP_H - RecPill.H) // 2)
         self.pill = RecPill(left, self._rec_click, bg=bar)
         self.pill.pack(side="left")
-        self.b_pause = IconButton(left, "pause", self.group.toggle_pause, "Пауза  (Ctrl+P)", bg=bar)
+        self.b_pause = IconButton(left, "pause", lambda: self.group.toggle_pause(), "Пауза  (Ctrl+P)", bg=bar)
         self.b_stop = IconButton(left, "stop", self.stop_rec, "Остановить и сохранить  (Ctrl+S)", bg=bar)
         self.b_pause.pack(side="left", padx=(4, 0))
         self.b_stop.pack(side="left", padx=(4, 0))
@@ -1156,6 +1339,69 @@ class DeviceWindow(tk.Toplevel):
         self._save_info = None
         self._disc_btn = None
         self._update_controls()
+
+    def set_group(self, group):
+        """Перенести окно в другую группу записи (только когда запись не идёт)."""
+        if group is self.group:
+            return
+        old = self.group
+        if self in old.members:
+            old.members.remove(self)
+        self.group = group
+        group.add(self)
+        old.refresh()
+        group.refresh()
+
+    # --- чёткий показ на Mac
+    def _native_start(self):
+        try:
+            import mac_video
+            self.update_idletasks()
+            self.native = mac_video.MacVideo(self, self.canvas)
+            self.canvas.bind("<Configure>", lambda e: self._native_place(), add="+")
+            self.link.note(f"чёткий показ включён (Retina ×{self.native.scale:g})")
+            self._draw_frame()
+            for tag in ("toast", "savecard", "banner"):
+                self._mirror(tag)
+        except Exception as e:  # noqa
+            self.native = None
+            self.link.note(f"чёткий показ недоступен: {e!r}")
+
+    def _native_stop(self, err=None):
+        if self.native is not None:
+            if err is not None:
+                self.link.note(f"чёткий показ выключен из-за ошибки: {err!r}")
+            self.native.close()
+            self.native = None
+
+    def _native_place(self):
+        if self.native is not None:
+            try:
+                self.native.place()
+                for tag in ("toast", "savecard", "banner"):
+                    self._mirror(tag)
+            except Exception as e:  # noqa
+                self._native_stop(e)
+
+    def _mirror(self, tag):
+        """Повторить подсказку (плашку, карточку, предупреждение) поверх нативного видео."""
+        if self.native is None:
+            return
+        try:
+            import mac_video
+            from ui_kit import _families
+            prims = []
+            if self.canvas.find_withtag(tag):
+                prims = list(self._ov_rects.get(tag, [])) + mac_video.text_prims(self.canvas, tag,
+                                                                                  _families()["mono"])
+            self.native.set_overlay(tag, prims)
+        except Exception as e:  # noqa
+            self._native_stop(e)
+            self.canvas.itemconfigure(self.img_item, state="normal")
+
+    def _ov_clear(self, tag):
+        self.canvas.delete(tag)
+        self._mirror(tag)
 
     def _csize(self):
         c = self.canvas
@@ -1208,10 +1454,17 @@ class DeviceWindow(tk.Toplevel):
         """Тонкая рамка вокруг экрана: красная — идёт запись, янтарная — пауза."""
         c = self.canvas
         c.delete("recframe")
-        if not self._frame_state:
+        col = None
+        if self._frame_state:
+            col = C["rec"] if self._frame_state == "recording" else C["paused_frame"]
+        if self.native is not None:
+            try:
+                self.native.set_border(col)
+            except Exception as e:  # noqa
+                self._native_stop(e)
+        if not col:
             return
         cw, ch = self._csize()
-        col = C["rec"] if self._frame_state == "recording" else C["paused_frame"]
         c.create_rectangle(1, 1, cw - 1, ch - 1, outline=col, width=2, tags=("recframe",))
         c.tag_lower("recframe")
         c.tag_raise("recframe", self.img_item)
@@ -1246,6 +1499,22 @@ class DeviceWindow(tk.Toplevel):
         if self._closing:
             return
         text = self.link.new_log()
+        ln = self.link
+        if (self.ended is None and not self.got_frame and not self.noframe_warned and ln.started_at
+                and not getattr(self, "_reconnecting", False) and time.monotonic() - ln.started_at > 8):
+            self.noframe_warned = True
+            _, seq = self.decoder.latest()
+            ln.note(f"нет изображения через 8 с: видеопакетов {ln.vpackets}, размер {ln.vsize}, "
+                    f"кадров декодировано {seq + 1}, max_size {ln.max_size}, кодировщик {ln.encoder or 'по умолчанию'}")
+            self.noframe_shown = True
+            model = ln.props.get("model") or ln.device_name
+            sdk = ln.props.get("sdk") or "?"
+            self._show_disconnected(
+                "Нет изображения",
+                "Телефон подключён, но картинка не приходит. Разблокируйте экран телефона и подождите "
+                "пару секунд. Не помогло — попробуйте упрощённый режим видео.",
+                detail=f"{model} · API {sdk} · видеопакетов: {ln.vpackets}",
+                btn_text="Упрощённый режим", btn_cmd=self._simple_video, icon="phone")
         if "INJECT_EVENTS" in text and not self.input_warned:
             self.input_warned = True
             self._banner(input_help(self.link.props.get("manufacturer")))
@@ -1270,7 +1539,7 @@ class DeviceWindow(tk.Toplevel):
         if isinstance(info, str):
             info = dict(title=info, intro="", steps=[], note="")
         c = self.canvas
-        c.delete("banner")
+        self._ov_clear("banner")
         cw, _ = self._csize()
         x0, x1, top, pad = 12, cw - 12, 12, 14
         inner = x1 - x0 - 2 * pad
@@ -1297,8 +1566,14 @@ class DeviceWindow(tk.Toplevel):
         paint(c, x1 - x0, bottom - top, box(0, 0, x1 - x0, bottom - top, 14, C["amber_bg"], C["amber_line"]),
               tag=("banner", "banner_bg"), x=x0, y=top, clear=False)
         c.tag_lower("banner_bg", "banner_fg")
-        c.tag_bind("banner_x", "<ButtonRelease-1>", lambda e: c.delete("banner"))
-        c.tag_bind("banner_x", "<Enter>", lambda e: c.configure(cursor="hand2"))
+        self._ov_rects["banner"] = [
+            {"rect": (x0, top, x1 - x0, bottom - top), "r": 14, "fill": C["amber_bg"], "line": C["amber_line"]},
+            {"text": "⚠", "rect": (tx - 1, top + pad - 2, 22, 20), "size": 15, "color": C["amber_text"]},
+            {"text": "✕", "rect": (x1 - pad - 22, top + pad - 3, 22, 20), "size": 14, "color": C["hint_title"],
+             "align": "center"}]
+        self._mirror("banner")
+        c.tag_bind("banner_x", "<ButtonRelease-1>", lambda e: self._ov_clear("banner"))
+        c.tag_bind("banner_x", "<Enter>", lambda e: c.configure(cursor=""))
         c.tag_bind("banner_x", "<Leave>", lambda e: c.configure(cursor=""))
 
     def _on_ended(self, reason):
@@ -1312,6 +1587,14 @@ class DeviceWindow(tk.Toplevel):
             self._fit_window()
         frame, seq = self.decoder.latest()
         if frame is not None and seq != self.shown_seq:
+            if not self.got_frame:
+                self.got_frame = True
+                if self.noframe_shown:  # картинка всё-таки пришла — убрать экран «Нет изображения»
+                    self.noframe_shown = False
+                    self._clear_disc()
+                    self.canvas.itemconfigure(self.img_item, state="normal")
+                self.link.note(f"первый кадр через {time.monotonic() - (self.link.started_at or 0):.1f} с, "
+                               f"размер {self.dev_size}")
             self._show(frame)
             self.shown_seq = seq
         self._update_controls()
@@ -1328,13 +1611,7 @@ class DeviceWindow(tk.Toplevel):
         log = link.log_text()
         if quick and any(m in log for m in VIDEO_FAIL_MARKS) and self.video_retries < 2:
             # Кодировщик видео на телефоне не справился: сначала меньше разрешение, потом программный кодировщик.
-            self.video_retries += 1
-            if self.video_retries == 1:
-                ms = 1280 if (link.max_size == 0 or link.max_size > 1280) else 1024
-                enc = None
-            else:
-                ms = min(link.max_size or 1280, 1280)
-                enc = SOFT_ENCODERS[0] if link.props.get("sdk", 0) >= 29 else SOFT_ENCODERS[1]
+            ms, enc = self._video_fallback()
             self._show_disconnected("Переподключаюсь…", "Видеокодер телефона дал сбой — пробую упрощённый режим видео.",
                                     button=False)
             self.reconnect(max_size=ms, encoder=enc,
@@ -1360,12 +1637,30 @@ class DeviceWindow(tk.Toplevel):
             self._disc_btn.destroy()
             self._disc_btn = None
 
-    def _show_disconnected(self, title, text="", detail="", button=True):
+    def _video_fallback(self):
+        """Следующая ступень «упрощённого» видео: меньше разрешение, затем программный кодировщик."""
+        link = self.link
+        self.video_retries += 1
+        if self.video_retries == 1:
+            return (1280 if (link.max_size == 0 or link.max_size > 1280) else 1024), None
+        ms = min(link.max_size or 1280, 1280)
+        return ms, (SOFT_ENCODERS[0] if link.props.get("sdk", 0) >= 29 else SOFT_ENCODERS[1])
+
+    def _simple_video(self):
+        ms, enc = self._video_fallback()
+        self.link.note(f"упрощённый режим по кнопке: max_size {ms}, кодировщик {enc or 'по умолчанию'}")
+        self.reconnect(max_size=ms, encoder=enc,
+                       note=f"Упрощённый режим: {ms}p" + (" (программное кодирование)" if enc else ""))
+
+    def _show_disconnected(self, title, text="", detail="", button=True, btn_text=None, btn_cmd=None,
+                           icon=None):
         """Экран вместо видео: телефон отключён или идёт переподключение."""
         c = self.canvas
         self._clear_disc()
         c.delete("recframe")
         c.itemconfigure(self.img_item, state="hidden")
+        if self.native is not None:
+            self.native.set_visible(False)
         c.itemconfigure(self.msg_item, text="")
         cw, ch = self._csize()
         cx, maxw = cw / 2, min(300, cw - 48)
@@ -1374,7 +1669,7 @@ class DeviceWindow(tk.Toplevel):
 
         def tile(y):
             paint(c, 56, 56, box(0, 0, 56, 56, 16, C["panel"], C["line"])
-                  + icon_shapes("phone_off" if button else "refresh", 14, 14, 28, C["text2"]),
+                  + icon_shapes(icon or ("phone_off" if button else "refresh"), 14, 14, 28, C["text2"]),
                   tag=tags, x=cx - 28, y=y, clear=False)
         items.append((56, tile))
 
@@ -1401,8 +1696,8 @@ class DeviceWindow(tk.Toplevel):
                 c.tag_lower("disc_bg", it)
             items.append((bh, place))
         if button:
-            self._disc_btn = Button(c, "Подключить снова", self.reconnect, kind="primary", icon="refresh",
-                                    height=40, radius=10, size=14, bg=C["video"])
+            self._disc_btn = Button(c, btn_text or "Подключить снова", btn_cmd or self.reconnect, kind="primary",
+                                    icon="refresh", height=40, radius=10, size=14, bg=C["video"])
 
             def place_btn(y):
                 c.create_window(cx, y + 4, anchor="n", window=self._disc_btn, tags=tags)
@@ -1421,6 +1716,8 @@ class DeviceWindow(tk.Toplevel):
         self._reconnecting = True
         self._clear_disc()
         self.canvas.itemconfigure(self.msg_item, text="Подключение…")
+        if self.native is not None:
+            self.native.set_visible(False)
         old = self.link
         new = old.clone(audio=audio, max_size=max_size, encoder=encoder)
 
@@ -1449,6 +1746,7 @@ class DeviceWindow(tk.Toplevel):
                 self.player = None
             self.aconf = None
             self.dev_size, self.img_rect, self.shown_seq = None, None, -1
+            self.got_frame = self.noframe_warned = self.noframe_shown = False
             self.ended, self.ended_handled = None, False
             self.canvas.itemconfigure(self.img_item, state="normal")
             self.canvas.itemconfigure(self.msg_item, text="Подключение…")
@@ -1472,7 +1770,7 @@ class DeviceWindow(tk.Toplevel):
         w, h = self.dev_size
         self.sized_for = self.dev_size
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        n = max(1, len(self.group.members))
+        n = max(1, len(self.layout.windows))
         max_vh = int(sh * self.size_frac) - TOP_H - BOT_H - 2 - 30
         max_vw = int(sw * 0.94 / n) - 14
         scale = min(max_vh / h, max_vw / w, 1.0)
@@ -1487,7 +1785,7 @@ class DeviceWindow(tk.Toplevel):
         self.after_idle(self._draw_frame)
         if self._save_info:
             self.after_idle(lambda: self._save_card(self._save_info))
-        self.after(50, self.group.arrange)
+        self.after(50, self.layout.arrange)
 
     def _show(self, frame):
         from PIL import ImageTk
@@ -1498,7 +1796,33 @@ class DeviceWindow(tk.Toplevel):
         fw, fh = frame.width, frame.height
         scale = min(cw / fw, ch / fh)
         w, h = max(2, round(fw * scale)), max(2, round(fh * scale))
-        img = frame.to_image(width=w, height=h)
+        if self.sharp and not self.native_tried:
+            self.native_tried = True
+            self._native_start()
+        if self.native is not None:
+            try:
+                k = self.native.scale
+                pw, ph = max(2, round(w * k)) & ~1, max(2, round(h * k)) & ~1
+                try:
+                    arr = frame.to_ndarray(width=pw, height=ph, format="bgra",
+                                           interpolation="AREA" if pw < fw else "BICUBIC")
+                except TypeError:
+                    arr = frame.to_ndarray(width=pw, height=ph, format="bgra")
+                import numpy as np
+                self.native.show(np.ascontiguousarray(arr))
+                x0, y0 = (cw - w) // 2, (ch - h) // 2
+                self.img_rect = (x0, y0, w, h)
+                self.canvas.itemconfigure(self.img_item, state="hidden")
+                if self.canvas.itemcget(self.msg_item, "text") == "Подключение…":
+                    self.canvas.itemconfigure(self.msg_item, text="")
+                return
+            except Exception as e:  # noqa — что-то пошло не так: дальше показываем по-старому
+                self._native_stop(e)
+                self.canvas.itemconfigure(self.img_item, state="normal")
+        try:  # AREA — честное усреднение при уменьшении: мелкий текст читается лучше
+            img = frame.to_image(width=w, height=h, interpolation="AREA" if w < fw else "BICUBIC")
+        except TypeError:
+            img = frame.to_image(width=w, height=h)
         if self.photo is not None and (self.photo.width(), self.photo.height()) == (w, h):
             self.photo.paste(img)
         else:
@@ -1524,7 +1848,8 @@ class DeviceWindow(tk.Toplevel):
         self.bind("<KeyPress>", self._key)
         mods = ["Control"] + (["Command"] if IS_MAC else [])
         for m in mods:
-            for seq, fn in (("r", self.group.start), ("p", self.group.toggle_pause), ("s", self.stop_rec),
+            for seq, fn in (("r", lambda: self.group.start()), ("p", lambda: self.group.toggle_pause()),
+                            ("s", self.stop_rec),
                             ("S", self.screenshot), ("m", self.toggle_sound)):
                 try:
                     self.bind(f"<{m}-{seq}>", lambda e, f=fn: (f(), "break")[1])
@@ -1633,7 +1958,7 @@ class DeviceWindow(tk.Toplevel):
             self.after_cancel(self._toast_job)
             self._toast_job = None
         c = self.canvas
-        c.delete("toast")
+        self._ov_clear("toast")
         if not text:
             return
         cw, ch = self._csize()
@@ -1650,25 +1975,28 @@ class DeviceWindow(tk.Toplevel):
         paint(c, bw, bh, box(0, 0, bw, bh, 12, C["toast"]), tag=("toast", "toast_bg"), x=x0 - 14, y=y0 - 10,
               clear=False)
         c.tag_lower("toast_bg", t)
+        self._ov_rects["toast"] = [{"rect": (x0 - 14, y0 - 10, bw, bh), "r": 12, "fill": C["toast"]}]
+        self._mirror("toast")
         c.tag_unbind("toast", "<ButtonRelease-1>")
         if link:
             c.tag_bind("toast", "<ButtonRelease-1>",
-                       lambda e: (c.delete("toast"), action()) if action else open_folder(folder))
-            c.tag_bind("toast", "<Enter>", lambda e: c.configure(cursor="hand2"))
+                       lambda e: (self._ov_clear("toast"), action()) if action else open_folder(folder))
+            c.tag_bind("toast", "<Enter>", lambda e: c.configure(cursor=""))
             c.tag_bind("toast", "<Leave>", lambda e: c.configure(cursor=""))
         if not sticky:
-            self._toast_job = self.after(9000 if action else (4500 if folder else 2200), lambda: c.delete("toast"))
+            self._toast_job = self.after(9000 if action else (4500 if folder else 2200),
+                                         lambda: self._ov_clear("toast"))
 
     def _save_card(self, info):
         """Карточка внизу видео: что происходит с записью и сколько осталось."""
         if self._closing:
             return
         c = self.canvas
-        c.delete("savecard")
+        self._ov_clear("savecard")
         self._save_info = dict(info) if info else None
         if not info:
             return
-        c.delete("toast")
+        self._ov_clear("toast")
         cw, ch = self._csize()
         x0, x1, pad = 16, cw - 16, 16
         W, inner = x1 - x0, x1 - x0 - 2 * pad
@@ -1697,6 +2025,12 @@ class DeviceWindow(tk.Toplevel):
         c.coords(nt, x0 + pad, by + 6 + 12)
         c.tag_lower("save_bg", "save_fg")
         c.tag_raise("savecard")
+        self._ov_rects["savecard"] = [
+            {"rect": (x0, y0, W, H), "r": 14, "fill": C["card"], "line": C["card_line"]},
+            {"rect": (x0 + pad, by, inner, 6), "r": 3, "fill": C["hover"]}]
+        if fill_w > 0:
+            self._ov_rects["savecard"].append({"rect": (x0 + pad, by, max(6, fill_w), 6), "r": 3, "fill": C["text"]})
+        self._mirror("savecard")
 
     # --- закрытие
     def close(self):
@@ -1718,7 +2052,9 @@ class DeviceWindow(tk.Toplevel):
         if self._closing:
             return
         self._closing = True
+        self._native_stop()
         self.group.remove(self)
+        self.layout.remove(self)
         threading.Thread(target=self.link.stop, daemon=True).start()
         if self.player:
             self.player.close()

@@ -20,13 +20,13 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 
 import ui_kit as ui
 from ui_kit import C
 
 APP = "Takeone"
-VERSION = "1.3.0"
+VERSION = "1.4.2"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -181,9 +181,11 @@ def list_android():
         raise RuntimeError("adb не найден. Установите scrcpy (в нём есть adb) или Android platform-tools.")
     out = run([adb, "devices", "-l"]).stdout
     devs = []
-    for line in out.splitlines()[1:]:
+    lines = out.splitlines()
+    start = next((i + 1 for i, ln in enumerate(lines) if ln.startswith("List of devices")), 0)
+    for line in lines[start:]:
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 2 or line.startswith("*"):
             continue
         serial, state = parts[0], parts[1]
         model = next((x.split(":", 1)[1] for x in parts if x.startswith("model:")), "")
@@ -598,11 +600,16 @@ class App:
         self.max_size = tk.StringVar(value=cfg.get("max_size", "1920"))
         self.bitrate = tk.StringVar(value=cfg.get("bitrate", "8"))
         self.audio = tk.BooleanVar(value=cfg.get("audio", True))
+        self.together = tk.BooleanVar(value=cfg.get("together", True))
+        self.sharp = tk.BooleanVar(value=cfg.get("sharp", True))
         self.ap_name = tk.StringVar(value=cfg.get("ap_name", "Takeone"))
         self.limit_mb = tk.StringVar(value=cfg.get("limit_mb", "50"))
         win_size = cfg.get("win_size", "Большой")
         self.win_size = tk.StringVar(value=win_size if win_size in WIN_SIZES else "Большой")
         self.android_wins = []
+        self.android_layout = None
+        self._group_state = None
+        self._quitting = False
         self.ap_hint = None
         self.status = tk.StringVar(value="")
 
@@ -611,6 +618,7 @@ class App:
         root.bind("<Control-p>", lambda e: self.toggle_pause())
         root.bind("<Control-s>", lambda e: self.stop_rec())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<KeyPress>", lambda e: self.editor.key(e) if self.platform.get() == "Edit" else None)
 
         self._layout()
         self.update_buttons()
@@ -636,11 +644,13 @@ class App:
 
         # режим
         self.tabs = ui.Segmented(outer, [("Android", "Android"), ("iOS", "iPhone · USB"),
-                                         ("AirPlay", "iPhone · Wi-Fi")], self.platform, self._platform_changed)
-        if not IS_MAC:
-            self.tabs.disable("iOS", "Запись iPhone по кабелю работает только на Mac.\n"
-                                     "На Windows используйте «iPhone · Wi-Fi».")
+                                         ("AirPlay", "iPhone · Wi-Fi"), ("Edit", "Монтаж")],
+                                 self.platform, self._platform_changed)
         self.tabs.pack(fill="x")
+
+        # монтаж: обрезка и вырезание кусков
+        import editor
+        self.editor = editor.EditorPanel(outer, self, W)
 
         # список устройств
         self.dev_sec = sec = tk.Frame(outer, bg=bg)
@@ -698,6 +708,34 @@ class App:
         t2.pack(anchor="w", pady=(2, 0))
         for w in (t1, t2, lab):
             w.bind("<ButtonRelease-1>", lambda e: self.tg_audio.toggle())
+        row = tk.Frame(ao, bg=C["panel"])
+        row.pack(fill="x", pady=(16, 0))
+        self.tg_together = ui.Toggle(row, self.together, self._together_changed)
+        self.tg_together.pack(side="right")
+        lab = tk.Frame(row, bg=C["panel"])
+        lab.pack(side="left", fill="x")
+        t1 = ui.label(lab, "Общая запись телефонов", 14, weight="semibold")
+        t1.pack(anchor="w")
+        self.tg_together_sub = t2 = ui.label(lab, "", 12, C["muted"], wraplength=W - 110, justify="left")
+        t2.pack(anchor="w", pady=(2, 0))
+        for w in (t1, t2, lab):
+            w.bind("<ButtonRelease-1>", lambda e: self.tg_together.toggle())
+        self._together_text()
+        self.tg_sharp = None
+        if IS_MAC:
+            row = tk.Frame(ao, bg=C["panel"])
+            row.pack(fill="x", pady=(16, 0))
+            self.tg_sharp = ui.Toggle(row, self.sharp, self.save_settings)
+            self.tg_sharp.pack(side="right")
+            lab = tk.Frame(row, bg=C["panel"])
+            lab.pack(side="left", fill="x")
+            t1 = ui.label(lab, "Чёткая картинка (Retina)", 14, weight="semibold")
+            t1.pack(anchor="w")
+            t2 = ui.label(lab, "Видео через видеочип Mac — резко и плавно. Для новых окон телефона", 12,
+                          C["muted"], wraplength=W - 110, justify="left")
+            t2.pack(anchor="w", pady=(2, 0))
+            for w in (t1, t2, lab):
+                w.bind("<ButtonRelease-1>", lambda e: self.tg_sharp.toggle())
 
         self.limit_row = lr = tk.Frame(sb, bg=C["panel"])
         lr.pack(fill="x", pady=(16, 0))
@@ -752,8 +790,11 @@ class App:
     def _layout(self):
         """Порядок блоков зависит от режима: Android, iPhone по кабелю или по Wi-Fi."""
         plat = self.platform.get()
-        for w in (self.dev_sec, self.ap_sec, self.set_card, self.footer):
+        for w in (self.dev_sec, self.ap_sec, self.set_card, self.footer, self.editor):
             w.pack_forget()
+        if plat == "Edit":
+            self.editor.pack(fill="x", pady=(20, 22))
+            return
         (self.ap_sec if plat == "AirPlay" else self.dev_sec).pack(fill="x", pady=(20, 0))
         self.dev_title.configure(text="Телефоны" if plat == "Android" else "iPhone и iPad")
         self.set_card.pack(fill="x", pady=(20, 0))
@@ -764,6 +805,8 @@ class App:
         self.footer.pack(fill="x", pady=(20, 22))
 
     def _platform_changed(self):
+        if self.platform.get() != "Edit":
+            self.editor.on_hide()
         self.devices, self.selected = [], []
         self.status.set("")
         self._render_rows()
@@ -790,16 +833,63 @@ class App:
                          "Подключите iPhone кабелем, разблокируйте и нажмите «Доверять»,\nзатем «Обновить».",
                          12, C["muted"], justify="center").pack(pady=(4, 0))
             return
+        live = self._open_ids()
         for i, (uid, title, sub, ready) in enumerate(self.devices):
-            r = ui.DeviceRow(body, title, sub, ("ok", "Готов") if ready else ("wait", "Ждёт"), self._row_click,
-                             checked=uid in self.selected, enabled=ready, radio=plat != "Android")
+            st = ("live", "В окне") if uid in live else (("ok", "Готов") if ready else ("wait", "Ждёт"))
+            r = ui.DeviceRow(body, title, sub, st, self._row_click, checked=uid in self.selected or uid in live,
+                             enabled=ready and uid not in live, radio=plat != "Android")
             r.uid = uid
-            r.ready = ready
+            r.ready = ready and uid not in live
             r.pack(fill="x", pady=(0 if i == 0 else 4, 0))
             self.rows.append(r)
 
+    app_name = APP
+
+    def video_dir(self):
+        return default_video_dir()
+
+    def ffmpeg(self):
+        return tool("ffmpeg")
+
+    def _groups(self):
+        """Группы записи открытых окон телефонов (одна общая или по одной на телефон)."""
+        out = []
+        for w in self.android_wins:
+            if w.group not in out:
+                out.append(w.group)
+        return out
+
+    def _rec_active(self):
+        return any(g.state != "idle" for g in self._groups())
+
+    def _new_group(self):
+        import android_view
+        return android_view.RecordGroup(tool("ffmpeg"), default_video_dir(), None, self.limit(), APP)
+
+    def _together_changed(self):
+        """Переключили «Общую запись» при открытых окнах — перераспределить окна по группам."""
+        self._together_text()
+        if self.android_wins and not self._rec_active():
+            if self.together.get():
+                g = self._new_group()
+                for w in self.android_wins:
+                    w.set_group(g)
+            else:
+                for w in self.android_wins:
+                    w.set_group(self._new_group())
+        self.save_settings()
+        self.update_buttons()
+
+    def _together_text(self):
+        self.tg_together_sub.configure(
+            text="Несколько телефонов — одно видео: экраны рядом, без звука" if self.together.get() else
+            "Каждый телефон — своё видео со звуком и свои кнопки записи")
+
+    def _open_ids(self):
+        return {w.link.serial for w in self.android_wins}
+
     def _row_click(self, row):
-        if self.busy or self.state != "idle":
+        if self.busy or self.state != "idle" or row.uid in self._open_ids():
             return
         if self.platform.get() == "Android":
             if row.uid in self.selected:
@@ -850,23 +940,52 @@ class App:
         plat = self.platform.get()
         android = plat == "Android"
         idle = s == "idle" and not b
-        self.tabs.set_enabled(s == "idle" and (not b or self.searching))
+        live = self._open_ids()
+        rec = self._rec_active()
+        self.tabs.set_enabled(not b or self.searching)
+        dis = {}
+        if not IS_MAC:
+            dis["iOS"] = "Запись iPhone по кабелю работает только на Mac.\nНа Windows используйте «iPhone · Wi-Fi»."
+        if live:
+            for k in ("iOS", "AirPlay"):
+                dis.setdefault(k, "Сначала закройте окна Android-телефонов")
+        if s != "idle":
+            for k in ("Android", "iOS", "AirPlay"):
+                if k != plat:
+                    dis.setdefault(k, "Сначала отключите iPhone")
+        self.tabs.set_disabled(dis)
+        if plat == "Edit":
+            self.editor.changed()
+            return
         self.btn_refresh.set(enabled=idle and not self.searching)
         for r in self.rows:
             r.set(enabled=idle and r.ready)
-        for f in (self.f_size, self.f_rate, self.f_ap, self.f_limit):
+        for f in (self.f_size, self.f_rate, self.f_ap):
             f.set_enabled(idle)
+        self.f_limit.set_enabled(idle and not rec)
         self.seg_size.set_enabled(idle)
         self.tg_audio.set_enabled(idle)
-        sel = [d for d in self.devices if d[0] in self.selected and d[3]]
+        if self.tg_sharp:
+            self.tg_sharp.set_enabled(not b)
+        self.tg_together.set_enabled(not b and not rec)
+        sel = [d for d in self.devices if d[0] in self.selected and d[3] and d[0] not in live]
 
         # подсказка под списком
-        if android:
+        if android and live:
+            n, k = len(sel), len(live)
+            hint = ("Идёт запись — добавить телефон можно после её остановки." if rec else
+                    f"Открыто окон: {k}. Отметьте ещё телефон, чтобы добавить его к трансляции." if n == 0 else
+                    f"Добавится {n} — окон станет {k + n}, "
+                    + ("запись пойдёт в одно видео без звука." if self.together.get() else
+                       "у каждого телефона своя запись."))
+        elif android:
             n = len(sel)
             hint = ("" if not self.devices else
                     "Отметьте телефон, чтобы открыть трансляцию." if n == 0 else
                     "Окно телефона откроется с панелью записи сверху." if n == 1 else
-                    f"Отмечено {n} — окна откроются рядом, запись пойдёт в одно видео без звука.")
+                    f"Отмечено {n} — окна откроются рядом, "
+                    + ("запись пойдёт в одно видео без звука." if self.together.get() else
+                       "у каждого телефона своя запись со звуком."))
         else:
             hint = ("Запись сохраняется одним файлом, паузы вырезаются." if self.devices else "")
         self.dev_hint.configure(text=hint)
@@ -881,9 +1000,10 @@ class App:
         if android or s == "idle":
             n = len(sel)
             if android:
-                text = ("Открыть трансляцию" if n <= 1 else
-                        f"Открыть {n} {ui.plural(n, 'трансляцию', 'трансляции', 'трансляций')}")
-                ok = n > 0
+                verb = "Добавить" if live else "Открыть"
+                text = (f"{verb} трансляцию" if n <= 1 else
+                        f"{verb} {n} {ui.plural(n, 'трансляцию', 'трансляции', 'трансляций')}")
+                ok = n > 0 and not rec
             else:
                 text, ok = "Подключить", plat == "AirPlay" or bool(sel)
             self.btn_main.set(text=text, enabled=ok and not b and s == "idle")
@@ -913,7 +1033,7 @@ class App:
 
     # --- устройства
     def refresh(self):
-        if self.state != "idle" or self.busy:
+        if self.state != "idle" or self.busy or self.platform.get() == "Edit":
             return
         plat = self.platform.get()
         ios = plat == "iOS"
@@ -955,7 +1075,7 @@ class App:
             ready = [d[0] for d in self.devices if d[3]]
             keep = [u for u in prev if u in ready]
             if plat == "Android":
-                self.selected = keep or ready[:1]
+                self.selected = keep or ([] if self.android_wins else ready[:1])
             else:
                 self.selected = keep[:1] or ready[:1]
             self._render_rows()
@@ -993,12 +1113,20 @@ class App:
         save_settings({"platform": self.platform.get(), "max_size": self.max_size.get(),
                        "bitrate": self.bitrate.get(), "audio": self.audio.get(),
                        "ap_name": self.ap_name.get(), "limit_mb": self.limit_mb.get(),
-                       "win_size": self.win_size.get()})
+                       "win_size": self.win_size.get(), "together": self.together.get(),
+                       "sharp": self.sharp.get()})
 
     def open_android(self):
-        if self.busy or self.android_wins:
+        """Открывает окна отмеченных телефонов. Если трансляция уже идёт — добавляет новые
+        телефоны к ней (в общую запись), не закрывая открытые окна."""
+        if self.busy:
             return
-        serials = [d[0] for d in self.devices if d[0] in self.selected and d[3]]
+        if self._rec_active():
+            messagebox.showinfo(APP, "Сейчас идёт запись. Остановите её в окне телефона — "
+                                     "после этого можно добавить ещё телефон.")
+            return
+        live = self._open_ids()
+        serials = [d[0] for d in self.devices if d[0] in self.selected and d[3] and d[0] not in live]
         if not serials:
             messagebox.showwarning(APP, "Отметьте телефон в списке.")
             return
@@ -1034,14 +1162,27 @@ class App:
                 ln.stop()
 
         def done(_):
-            group = android_view.RecordGroup(tool("ffmpeg"), default_video_dir(), None, self.limit(), APP)
+            if self.android_layout is None or not self.android_wins:
+                self.android_layout = android_view.WindowLayout()
+            shared = None
+            if self.together.get():
+                shared = self.android_wins[0].group if self.android_wins else self._new_group()
             frac = WIN_SIZES.get(self.win_size.get(), 0.86)
             for ln in links:
+                group = shared or self._new_group()
                 self.android_wins.append(android_view.DeviceWindow(
-                    self.root, ln, group, default_shots_dir(), self._android_closed, frac, APP))
-            self.state = "connected"
-            self.status.set("Трансляция открыта в отдельном окне.")
-            self.root.withdraw()
+                    self.root, ln, group, default_shots_dir(), self._android_closed, frac, APP,
+                    layout=self.android_layout, sharp=self.sharp.get()))
+            self.android_layout.arranged = False
+            for w in self.android_wins:  # окна делят ширину экрана — пересчитать размеры
+                if w.dev_size:
+                    w._fit_window()
+            for g in self._groups():
+                g.limit_mb = self.limit()
+                g.refresh()
+            self.selected = [u for u in self.selected if u not in self._open_ids()]
+            self.status.set("")
+            self._render_rows()
 
         self.bg(start_all, done, stop_all,
                 "Подключаюсь к телефону…" if len(links) == 1 else f"Подключаюсь к телефонам ({len(links)})…")
@@ -1049,11 +1190,12 @@ class App:
     def _android_closed(self, win):
         if win in self.android_wins:
             self.android_wins.remove(win)
-        if self.android_wins:
-            return
-        self.state = "idle"
-        self.status.set("Трансляция закрыта.")
-        self.root.deiconify()
+        if not self.android_wins:
+            self.android_layout = None
+            if self._quitting:
+                self.shutdown()
+                return
+        self._render_rows()
         self.update_buttons()
 
     # --- подключение
@@ -1084,7 +1226,13 @@ class App:
 
     # --- запись
     def start_rec(self):
-        if self.busy or self.state not in ("idle", "connected") or self.platform.get() == "Android":
+        if self.platform.get() == "Edit":
+            return
+        if self.platform.get() == "Android":
+            for g in self._groups():
+                g.start()
+            return
+        if self.busy or self.state not in ("idle", "connected"):
             return
         if self.state == "idle":
             try:
@@ -1106,6 +1254,12 @@ class App:
         self.bg(fn, done, fail, "Запускаю запись…")
 
     def toggle_pause(self):
+        if self.platform.get() == "Edit":
+            return
+        if self.platform.get() == "Android":
+            for g in self._groups():
+                g.toggle_pause()
+            return
         if self.busy or self.state not in ("recording", "paused"):
             return
         if self.state == "recording":
@@ -1129,6 +1283,15 @@ class App:
             self.seg_started = None
 
     def stop_rec(self):
+        if self.platform.get() == "Edit":
+            return
+        if self.platform.get() == "Android":
+            done = []
+            for w in list(self.android_wins):
+                if w.group not in done:
+                    done.append(w.group)
+                    w.stop_rec()
+            return
         if self.busy or self.state not in ("recording", "paused"):
             return
         self._accumulate()
@@ -1137,20 +1300,18 @@ class App:
                 text="Завершаю запись…")
 
     def ask_save(self):
+        import save_dialog
         ios = isinstance(self.engine, IOSEngine)
-        name = "screen_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        while True:
-            dest = filedialog.asksaveasfilename(
-                title="Сохранить запись", initialdir=default_video_dir(), initialfile=name,
-                defaultextension=".mp4",
-                filetypes=[("MP4", "*.mp4"), ("QuickTime MOV", "*.mov")] if ios
-                else [("MP4", "*.mp4"), ("Matroska MKV", "*.mkv")])
-            if dest:
-                break
-            if messagebox.askyesno(APP, "Удалить эту запись без сохранения?"):
-                self.engine.cleanup()
-                self.after_record("Запись удалена.")
-                return
+        kind = "ios" if ios else "airplay"
+        name = f"{APP}_iPhone_" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        folder = save_dialog.last_dir(default_video_dir())
+        ext = save_dialog.load_prefs().get(f"ext_{kind}", "mp4")
+        res, dest = save_dialog.ask(self.root, APP, save_dialog.unique_name(folder, name, ext), kind=kind,
+                                    folder=folder, info=f"Длительность {ui.fmt_hms(self.elapsed)}")
+        if res != "save":
+            self.engine.cleanup()
+            self.after_record("Запись удалена.")
+            return
 
         eng, limit, ff = self.engine, self.limit(), tool("ffmpeg")
 
@@ -1166,6 +1327,11 @@ class App:
                 finally:
                     if os.path.exists(path):
                         shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                import android_view
+                android_view.remember_video(path)
+            except Exception:  # noqa
+                pass
             return path
 
         self.save_settings()
@@ -1186,6 +1352,14 @@ class App:
     def tick(self):
         if self.state in ("connected", "recording", "paused"):
             self._update_recbar()
+        groups = self._groups()
+        gs = tuple(g.state for g in groups)
+        if gs != self._group_state:
+            self._group_state = gs
+            self.update_buttons()
+        for g in groups:
+            if g.state == "idle":
+                g.limit_mb = self.limit()
         if not self.busy and isinstance(self.engine, AirPlayEngine) and self.engine.alive():
             hint = ("iPhone транслирует экран." if self.engine.client_connected() else
                     f"Ждём iPhone: Пункт управления → Повтор экрана → «{self.engine.name}».")
@@ -1211,6 +1385,11 @@ class App:
         if self.busy:
             return
         if self.android_wins:
+            if self._rec_active():
+                messagebox.showinfo(APP, "Идёт запись. Остановите и сохраните её в окне телефона, "
+                                         "потом закройте Takeone.")
+                return
+            self._quitting = True
             for w in list(self.android_wins):
                 w.close()
             return

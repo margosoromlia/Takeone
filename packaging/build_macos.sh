@@ -26,7 +26,8 @@ mkdir -p "$BIN/scrcpy" "$BIN/ffmpeg"
 
 echo "== Python-зависимости"
 "$PY" -m pip install --quiet --upgrade pip
-"$PY" -m pip install --quiet pyinstaller imageio-ffmpeg pillow av numpy sounddevice
+"$PY" -m pip install --quiet pyinstaller imageio-ffmpeg pillow av numpy sounddevice \
+  pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
 "$PY" -c "import tkinter" || { echo "у этого Python нет tkinter — поставьте Python с python.org" >&2; exit 1; }
 
 echo "== scrcpy $SCRCPY (с adb)"
@@ -56,7 +57,9 @@ echo "== PyInstaller"
   --icon "$BUILD/icon.icns" --osx-bundle-identifier app.takeone \
   --distpath "$BUILD/dist" --workpath "$BUILD/work" --specpath "$BUILD" \
   --add-data "$BIN:bin" \
-  --paths "$ROOT/app" --hidden-import android_view --hidden-import ui_kit --collect-submodules av \
+  --paths "$ROOT/app" --hidden-import android_view --hidden-import ui_kit --hidden-import editor --hidden-import save_dialog --collect-submodules av \
+  --hidden-import mac_video --hidden-import objc --hidden-import AppKit --hidden-import Foundation \
+  --hidden-import Quartz \
   "$ROOT/app/takeone.py"
 
 APPDIR="$BUILD/dist/Takeone.app"
@@ -64,6 +67,8 @@ PLIST="$APPDIR/Contents/Info.plist"
 # Без этих строк macOS не даст захватывать экран iPhone по USB (он считается «камерой»)
 plutil -replace NSCameraUsageDescription -string "Takeone показывает и записывает экран iPhone/iPad, подключённого по USB." "$PLIST"
 plutil -replace NSMicrophoneUsageDescription -string "Takeone записывает звук iPhone/iPad, подключённого по USB." "$PLIST"
+# Чёткий интерфейс и видео на Retina
+plutil -replace NSHighResolutionCapable -bool true "$PLIST"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
 plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
 # PyAV для Apple Silicon собран под macOS 14+, для Intel — под 11+
