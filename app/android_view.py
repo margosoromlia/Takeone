@@ -1029,11 +1029,18 @@ class WindowLayout:
         sw = ws[0].winfo_screenwidth()
         x = max(0, (sw - total) // 2)
         if main_shown:
-            right = main.winfo_rootx() + main.winfo_width() + gap
+            mw = main.winfo_width()
+            right = main.winfo_rootx() + mw + gap
             if right + total <= sw:
                 x = right
-            elif total + main.winfo_width() + gap <= sw:
-                x = sw - total  # не влезает справа от главного окна — прижать к правому краю
+            elif total + mw + gap <= sw:  # не влезает справа — подвинуть главное окно левее
+                try:
+                    my = int(main.geometry().split("+")[2])
+                    mx = max(0, sw - total - gap - mw)
+                    main.geometry(f"+{mx}+{my}")
+                    x = mx + mw + gap
+                except (tk.TclError, ValueError, IndexError):
+                    x = sw - total
         for w, wd in zip(ws, widths):
             w.geometry(f"+{x}+30")
             x += wd + gap

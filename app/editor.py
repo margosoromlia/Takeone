@@ -256,7 +256,9 @@ def make_strip(path, strip_w, tile_h, done):
 
 # --- шкала времени ---------------------------------------------------------------------------
 class Timeline(tk.Canvas):
-    H, PAD, TY0, TY1 = 66, 10, 9, 57
+    """Шкала: миниатюры кадров, белые ручки начала/конца, бегунок сверху.
+    Протянуть мышью по кадрам — выделить кусок; щелчок — перейти в это место."""
+    H, PAD, TY0, TY1 = 76, 10, 16, 64
 
     def __init__(self, parent, ed):
         super().__init__(parent, height=self.H, width=400, bg=ui.bg_of(parent), highlightthickness=0, bd=0)
@@ -264,6 +266,7 @@ class Timeline(tk.Canvas):
         self.tiles = []
         self._imgs = []
         self.drag = None
+        self.press_x = self.press_t = None
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
@@ -300,13 +303,10 @@ class Timeline(tk.Canvas):
         th = self.TY1 - self.TY0
         if self.tiles and ed.dur:
             strip = Image.new("RGBA", (int(x1 - x0), th), (36, 38, 45, 255))
-            x = 0
             n = len(self.tiles)
             step = (x1 - x0) / n
             for i, t in enumerate(self.tiles):  # каждая миниатюра — по центру своего отрезка
-                cx = int(i * step + step / 2 - t.width / 2)
-                strip.paste(t, (cx, 0))
-                x += step
+                strip.paste(t, (int(i * step + step / 2 - t.width / 2), 0))
             mask = Image.new("L", strip.size, 0)
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, strip.width - 1, th - 1), radius=8, fill=255)
             strip.putalpha(mask)
@@ -323,60 +323,77 @@ class Timeline(tk.Canvas):
         self._veil(self.x_of(ed.tout), x1, (10, 11, 14, 200))
         for i, (a, b) in enumerate(ed.cuts):
             xa, xb = self.x_of(a), self.x_of(b)
-            self._veil(xa, xb, (200, 54, 59, 150))
+            self._veil(xa, xb, (200, 54, 59, 170))
             self.create_line(xa, self.TY0, xa, self.TY1, fill=C["red"], width=2)
             self.create_line(xb, self.TY0, xb, self.TY1, fill=C["red"], width=2)
             cx, cy = (xa + xb) / 2, (self.TY0 + self.TY1) / 2
-            tag = ("cutx", f"cut{i}")
-            ui.paint(self, 20, 20, [("circle", 10, 10, 10, C["rec"], None)] + ui.icon_shapes("close", 4, 4, 12, "#FFFFFF"),
-                     tag=tag, x=cx - 10, y=cy - 10, clear=False)
-        if ed.sel_a is not None:
-            a = ed.sel_a
-            b = ed.sel_b if ed.sel_b is not None else a
-            xa, xb = sorted((self.x_of(a), self.x_of(b)))
-            self._veil(xa, xb, (245, 181, 71, 70))
-            for xx in {xa, xb}:
-                self.create_line(xx, self.TY0 - 3, xx, self.TY1 + 3, fill=C["amber_text"], width=2)
+            ui.paint(self, 22, 22, [("circle", 11, 11, 11, C["rec"], None)]
+                     + ui.icon_shapes("close", 5, 5, 12, "#FFFFFF"), tag=("cutx", f"cut{i}"), x=cx - 11, y=cy - 11,
+                     clear=False)
+        sel = ed._sel(raw=True)
+        if sel:
+            xa, xb = self.x_of(sel[0]), self.x_of(sel[1])
+            self._veil(xa, xb, (245, 181, 71, 80))
+            for xx in (xa, xb):
+                self.create_line(xx, self.TY0 - 4, xx, self.TY1 + 4, fill=C["amber_text"], width=2)
+            if ed._sel():  # кнопка «Вырезать» прямо на выделении
+                f = ui.font(12, "semibold")
+                bw, bh = ui.measure(f, "Вырезать") + 36, 24
+                cx = min(max((xa + xb) / 2, x0 + bw / 2), x1 - bw / 2)
+                cy = (self.TY0 + self.TY1) / 2
+                ui.paint(self, bw, bh, ui.box(0, 0, bw, bh, bh / 2, C["amber_text"])
+                         + ui.icon_shapes("scissors", 9, 4, 16, C["on_light"]),
+                         tag=("cutbtn",), x=cx - bw / 2, y=cy - bh / 2, clear=False)
+                self.create_text(cx - bw / 2 + 29, cy, text="Вырезать", anchor="w", fill=C["on_light"], font=f,
+                                 tags=("cutbtn",))
         # ручки начала и конца
         for t in (ed.tin, ed.tout):
             x = self.x_of(t)
             ui.paint(self, 10, th + 8, ui.box(0, 0, 10, th + 8, 3, C["light"])
-                     + [("line", [(3.5, th / 2 - 2), (3.5, th / 2 + 10)], C["on_light"], 1.2),
-                        ("line", [(6.5, th / 2 - 2), (6.5, th / 2 + 10)], C["on_light"], 1.2)],
+                     + [("line", [(3.5, th / 2 - 6), (3.5, th / 2 + 6)], C["on_light"], 1.2),
+                        ("line", [(6.5, th / 2 - 6), (6.5, th / 2 + 6)], C["on_light"], 1.2)],
                      tag="handle", x=x - 5, y=self.TY0 - 4, clear=False)
         # бегунок
         x = self.x_of(ed.pos)
-        self.create_line(x, 2, x, self.H - 2, fill="#FFFFFF", width=2)
+        self.create_line(x, 4, x, self.H - 4, fill="#FFFFFF", width=2)
         ui.paint(self, 12, 12, [("circle", 6, 6, 6, "#FFFFFF", None)], tag="knob", x=x - 6, y=0, clear=False)
 
     def _grab(self, x):
         ed = self.ed
         cands = [("in", ed.tin), ("out", ed.tout)]
-        if ed.sel_a is not None:
-            cands.append(("sa", ed.sel_a))
-        if ed.sel_b is not None:
-            cands.append(("sb", ed.sel_b))
+        if ed.sel_a is not None and ed.sel_b is not None:
+            cands += [("sa", ed.sel_a), ("sb", ed.sel_b)]
         best = min(cands, key=lambda c: abs(self.x_of(c[1]) - x))
-        return best[0] if abs(self.x_of(best[1]) - x) <= 8 else None
+        return best[0] if abs(self.x_of(best[1]) - x) <= 7 else None
 
     def _hover(self, e):
         if not self.ed.dur:
             return
         tags = self.gettags("current")
-        self.configure(cursor="" if "cutx" in tags else
-                       ("sb_h_double_arrow" if self._grab(e.x) else ""))
+        on_btn = "cutbtn" in tags or "cutx" in tags
+        self.configure(cursor="" if on_btn else ("sb_h_double_arrow" if self._grab(e.x) else ""))
 
     def _press(self, e):
         ed = self.ed
         if not ed.dur or ed.saving:
             return
-        for t in self.gettags("current"):
-            if t.startswith("cut") and t != "cutx":
+        tags = self.gettags("current")
+        if "cutbtn" in tags:
+            ed.cut()
+            return
+        for t in tags:
+            if t.startswith("cut") and t not in ("cutx", "cutbtn"):
                 ed.restore_cut(int(t[3:]))
                 return
         ed.stop_play()
-        self.drag = self._grab(e.x) or "scrub"
-        self._motion(e)
+        self.drag = self._grab(e.x)
+        if self.drag is None:
+            if e.y < self.TY0:
+                self.drag = "scrub"
+                self._motion(e)
+            else:  # по кадрам: щелчок — перейти, протянуть — выделить кусок
+                self.drag = "pending"
+                self.press_x, self.press_t = e.x, self.t_of(e.x)
 
     def _motion(self, e):
         ed = self.ed
@@ -384,6 +401,11 @@ class Timeline(tk.Canvas):
             return
         t = self.t_of(e.x)
         d = self.drag
+        if d == "pending":
+            if abs(e.x - self.press_x) < 4:
+                return
+            self.drag = d = "sb"
+            ed.sel_a = self.press_t
         if d == "in":
             ed.tin = min(t, ed.tout - MIN_PART)
             t = ed.tin
@@ -398,18 +420,28 @@ class Timeline(tk.Canvas):
         ed.changed()
 
     def _release(self, e):
+        ed = self.ed
+        if self.drag == "pending":  # просто щелчок по кадрам
+            self.drag = None
+            sel = ed._sel(raw=True)
+            if sel and not (sel[0] <= self.press_t <= sel[1]):
+                ed.sel_a = ed.sel_b = None
+            ed.seek(self.press_t, exact=True)
+            ed.changed()
+            return
         if self.drag:
             self.drag = None
-            self.ed.seek(self.ed.pos, exact=True)
+            ed.seek(ed.pos, exact=True)
+            ed.changed()
 
 
 # --- вкладка ---------------------------------------------------------------------------------
 class EditorPanel(tk.Frame):
-    PREV_H = 320
 
-    def __init__(self, parent, app, width):
+    def __init__(self, parent, app, width, foot_parent=None):
         super().__init__(parent, bg=C["bg"])
         self.app, self.W = app, width
+        self.foot_parent = foot_parent or parent
         self.path = None
         self.prev = None
         self.dur = 0.0
@@ -421,6 +453,7 @@ class EditorPanel(tk.Frame):
         self._photo = None
         self._last_dest = None
         self._strip_imgs = None
+        self._chips_for = None
         self._build()
         self._tick()
 
@@ -428,7 +461,7 @@ class EditorPanel(tk.Frame):
     def _build(self):
         bg = C["bg"]
         head = tk.Frame(self, bg=bg)
-        head.pack(fill="x")
+        head.pack(side="top", fill="x")
         self.title = ui.label(head, "Монтаж", 15, weight="semibold")
         self.title.pack(side="left")
         self.b_open = ui.Button(head, "Открыть…", self.open_dialog, kind="secondary", icon="folder", height=32,
@@ -438,76 +471,85 @@ class EditorPanel(tk.Frame):
                                 radius=8, size=13)
         self.b_last.pack(side="right", padx=(0, 8))
 
-        card = ui.Card(self, pad=6, fill=C["panel"])
-        card.pack(fill="x", pady=(10, 0))
-        self.pc = tk.Canvas(card.body, bg=C["video"], height=self.PREV_H, width=self.W - 12, highlightthickness=0, bd=0)
-        self.pc.pack(fill="x")
-        self.pc.bind("<Configure>", lambda e: self._draw_preview())
-        self.pc.bind("<ButtonRelease-1>", lambda e: self.toggle_play() if self.dur else self.open_dialog())
+        # снизу вверх: подсказка, вырезанные куски, шкала, кнопки просмотра — а превью занимает остальное
+        self.help = ui.autowrap(ui.label(self, "", 12, C["muted"], wraplength=self.W, justify="left"))
+        self.help.pack(side="bottom", anchor="w", pady=(8, 0))
 
         row = tk.Frame(self, bg=bg)
-        row.pack(fill="x", pady=(10, 0))
+        row.pack(side="bottom", fill="x", pady=(6, 0))
+        self.b_cut = ui.Button(row, "Вырезать выделенное", self.cut, kind="quiet", icon="scissors", height=32,
+                               radius=8, size=13, tip="Протяните мышью по кадрам на шкале, потом сюда  (Delete)")
+        self.b_cut.pack(side="left")
+        self.b_reset = ui.IconButton(row, "undo", self.reset, "Сбросить: вернуть всё вырезанное и обрезанное",
+                                     bg=bg)
+        self.b_reset.pack(side="right")
+        self.chips = tk.Frame(row, bg=bg)
+        self.chips.pack(side="left", padx=(10, 0))
+
+        self.tl = Timeline(self, self)
+        self.tl.pack(side="bottom", fill="x", pady=(6, 0))
+
+        row = tk.Frame(self, bg=bg)
+        row.pack(side="bottom", fill="x", pady=(10, 0))
         self.b_play = ui.IconButton(row, "play", self.toggle_play, "Смотреть без звука  (Пробел)", bg=bg)
         self.b_play.pack(side="left")
         self.time_lbl = ui.label(row, "00:00.0 / 00:00.0", 13, C["text2"], mono=True)
         self.time_lbl.pack(side="left", padx=(8, 0))
         self.b_out = ui.Button(row, "Закончить здесь", lambda: self.set_trim("out"), kind="quiet", icon="mark_out",
-                               height=32, radius=8, size=13,
-                               tip="Всё, что после бегунка, не попадёт в видео")
+                               height=32, radius=8, size=13, tip="Всё, что после бегунка, не попадёт в видео")
         self.b_out.pack(side="right")
         self.b_in = ui.Button(row, "Начать отсюда", lambda: self.set_trim("in"), kind="quiet", icon="mark_in",
                               height=32, radius=8, size=13, tip="Всё, что до бегунка, не попадёт в видео")
         self.b_in.pack(side="right", padx=(0, 8))
 
-        self.tl = Timeline(self, self)
-        self.tl.pack(fill="x", pady=(8, 0))
+        card = ui.Card(self, pad=6, fill=C["panel"])
+        card.pack(side="top", fill="both", expand=True, pady=(10, 0))
+        self.pc = tk.Canvas(card.body, bg=C["video"], height=160, width=200, highlightthickness=0, bd=0)
+        self.pc.pack(fill="both", expand=True)
+        self.pc.bind("<Configure>", self._pc_conf)
+        self.pc.bind("<ButtonRelease-1>", lambda e: self.toggle_play() if self.dur else self.open_dialog())
 
-        row = tk.Frame(self, bg=bg)
-        row.pack(fill="x", pady=(8, 0))
-        self.b_sa = ui.Button(row, "Начало куска", lambda: self.mark("a"), kind="secondary", height=32, radius=8,
-                              size=13, tip="Поставьте бегунок в начало лишнего куска")
-        self.b_sa.pack(side="left")
-        self.b_sb = ui.Button(row, "Конец куска", lambda: self.mark("b"), kind="secondary", height=32, radius=8,
-                              size=13, tip="…и в его конец")
-        self.b_sb.pack(side="left", padx=(8, 0))
-        self.b_cut = ui.Button(row, "Вырезать", self.cut, kind="quiet", icon="scissors", height=32, radius=8,
-                               size=13, tip="Убрать выделенный кусок  (Delete)")
-        self.b_cut.pack(side="left", padx=(8, 0))
-        self.b_reset = ui.IconButton(row, "undo", self.reset, "Сбросить обрезку и вырезанные куски", bg=bg)
-        self.b_reset.pack(side="right")
-
-        self.help = ui.label(self, "", 12, C["muted"], wraplength=self.W, justify="left")
-        self.help.pack(anchor="w", pady=(8, 0))
-
-        card = ui.Card(self, pad=14)
-        card.pack(fill="x", pady=(14, 0))
-        b = card.body
-        top = tk.Frame(b, bg=C["panel"])
-        top.pack(fill="x")
-        ui.label(top, "Итог", 14, weight="semibold").pack(side="left")
-        self.total_lbl = ui.label(top, "—", 14, weight="semibold", mono=True)
-        self.total_lbl.pack(side="right")
-        self.sum_lbl = ui.label(b, "", 12, C["muted"], justify="left", wraplength=self.W - 40)
+        # низ окна: итог, лимит, «Сохранить» — всегда на виду
+        self.foot = ft = tk.Frame(self.foot_parent, bg=bg)
+        sr = tk.Frame(ft, bg=bg)
+        sr.pack(fill="x")
+        ui.label(sr, "Итог", 14, weight="semibold").pack(side="left")
+        self.total_lbl = ui.label(sr, "—", 14, weight="semibold", mono=True)
+        self.total_lbl.pack(side="left", padx=(8, 0))
+        ui.label(sr, "МБ", 13, C["text2"]).pack(side="right", padx=(8, 0))
+        self.f_limit = ui.Field(sr, self.app.limit_mb, width=60, height=32, justify="right")
+        self.f_limit.pack(side="right")
+        ui.label(sr, "Не больше", 13, C["text2"]).pack(side="right", padx=(0, 8))
+        self.sum_lbl = ui.autowrap(ui.label(ft, "", 12, C["muted"], justify="left", wraplength=self.W))
         self.sum_lbl.pack(anchor="w", pady=(2, 0))
-        ui.divider(b).pack(fill="x", pady=(12, 0))
-        lr = tk.Frame(b, bg=C["panel"])
-        lr.pack(fill="x", pady=(12, 0))
-        right = tk.Frame(lr, bg=C["panel"])
-        right.pack(side="right")
-        self.f_limit = ui.Field(right, self.app.limit_mb, width=64, justify="right")
-        self.f_limit.pack(side="left")
-        ui.label(right, "МБ", 13, C["text2"]).pack(side="left", padx=(8, 0))
-        lab = tk.Frame(lr, bg=C["panel"])
-        lab.pack(side="left")
-        ui.label(lab, "Видео не больше", 14, weight="semibold").pack(anchor="w")
-        ui.label(lab, "Больше — сожмётся при сохранении · 0 без лимита", 12, C["muted"]).pack(anchor="w", pady=(2, 0))
-
-        self.b_save = ui.Button(self, "Сохранить видео…", self.save, kind="primary", height=44, radius=10, size=15)
-        self.b_save.pack(fill="x", pady=(16, 0))
-        self.status = ui.label(self, "", 12, C["muted"], wraplength=self.W, justify="center")
-        self.status.pack(fill="x", pady=(10, 0))
+        self.b_save = ui.Button(ft, "Сохранить видео…", self.save, kind="primary", height=44, radius=10, size=15)
+        self.b_save.pack(fill="x", pady=(10, 0))
+        self.status = ui.autowrap(ui.label(ft, "", 12, C["muted"], wraplength=self.W, justify="center"))
+        self.status.pack(fill="x", pady=(8, 0))
         self.status.bind("<ButtonRelease-1>", lambda e: self._open_folder())
         self.changed()
+
+    def _pc_conf(self, e):
+        if self.prev:
+            self.prev.size = (max(40, e.width), max(40, e.height))
+            if not self.prev.playing:
+                self.prev.request(self.pos, exact=True)
+        self._draw_preview()
+
+    def _render_chips(self):
+        """Вырезанные куски списком: щелчок по куску возвращает его в видео."""
+        key = tuple(self.cuts)
+        if key == self._chips_for:
+            return
+        self._chips_for = key
+        for w in self.chips.winfo_children():
+            w.destroy()
+        for i, (a, b) in enumerate(self.cuts[:3]):
+            ui.Button(self.chips, f"{fmt_t(a)[:-2]}–{fmt_t(b)[:-2]}  ✕", lambda i=i: self.restore_cut(i),
+                      kind="secondary", height=28, radius=14, size=12,
+                      tip="Вырезано. Нажмите, чтобы вернуть этот кусок").pack(side="left", padx=(0, 6))
+        if len(self.cuts) > 3:
+            ui.label(self.chips, f"ещё {len(self.cuts) - 3}", 12, C["muted"]).pack(side="left")
 
     # --- файлы
     def _video_dir(self):
@@ -546,7 +588,7 @@ class EditorPanel(tk.Frame):
     def load(self, path):
         self.stop_play()
         try:
-            prev = Preview(path, (self.W - 12, self.PREV_H))
+            prev = Preview(path, (max(40, self.pc.winfo_width()), max(40, self.pc.winfo_height())))
         except Exception as e:  # noqa
             messagebox.showerror(self.app.app_name, f"Не получилось открыть видео:\n{e}", parent=self)
             return
@@ -566,7 +608,7 @@ class EditorPanel(tk.Frame):
         self.status.configure(text="", cursor="")
         self._last_dest = None
         prev.request(0.0)
-        make_strip(path, self.W - 2 * Timeline.PAD, Timeline.TY1 - Timeline.TY0, lambda imgs: setattr(self, "_strip_imgs", (path, imgs)))
+        make_strip(path, 1600, Timeline.TY1 - Timeline.TY0, lambda imgs: setattr(self, "_strip_imgs", (path, imgs)))
         self.changed()
 
     # --- действия
@@ -624,12 +666,20 @@ class EditorPanel(tk.Frame):
             self.sel_b = self.pos
         self.changed()
 
-    def _sel(self):
+    def _sel(self, raw=False):
+        """Выделенный кусок (начало, конец); raw — как нарисован, без обрезки по краям видео."""
         if self.sel_a is None or self.sel_b is None:
             return None
         a, b = sorted((self.sel_a, self.sel_b))
+        if raw:
+            return (a, b)
         a, b = max(a, self.tin), min(b, self.tout)
         return (a, b) if b - a >= 0.05 else None
+
+    def clear_sel(self):
+        if self.sel_a is not None:
+            self.sel_a = self.sel_b = None
+            self.changed()
 
     def cut(self):
         s = self._sel()
@@ -663,7 +713,7 @@ class EditorPanel(tk.Frame):
         playing = loaded and self.prev.playing
         self.b_play.set("pause" if playing else "play", loaded and idle,
                         "Пауза  (Пробел)" if playing else "Смотреть без звука  (Пробел)")
-        for b in (self.b_in, self.b_out, self.b_sa, self.b_sb):
+        for b in (self.b_in, self.b_out):
             b.set(enabled=loaded and idle)
         self.b_cut.set(enabled=loaded and idle and self._sel() is not None)
         self.b_reset.set(enabled=loaded and idle and (bool(self.cuts) or self.tin > 0 or self.tout < self.dur
@@ -677,7 +727,8 @@ class EditorPanel(tk.Frame):
             self.b_save.set(text="Сохранить видео…", enabled=loaded and total > 0.05)
         self.time_lbl.configure(text=f"{fmt_t(self.pos)} / {fmt_t(self.dur)}")
         if loaded:
-            self.title.configure(text=ui.ellipsize(ui.font(15, "semibold"), os.path.basename(self.path), self.W - 300))
+            tw = max(120, self.winfo_width() - self.b_open.winfo_width() - self.b_last.winfo_width() - 30)
+            self.title.configure(text=ui.ellipsize(ui.font(15, "semibold"), os.path.basename(self.path), tw))
             self.total_lbl.configure(text=fmt_t(total))
             parts = [f"из {fmt_t(self.dur)}"]
             if self.tin > 0.05:
@@ -692,18 +743,20 @@ class EditorPanel(tk.Frame):
             self.title.configure(text="Монтаж")
             self.total_lbl.configure(text="—")
             self.sum_lbl.configure(text="Откройте видео, чтобы обрезать его или вырезать лишнее.")
+        sel = self._sel()
         if not loaded:
             hint = ""
-        elif self.sel_a is not None and self.sel_b is None:
-            hint = "Начало куска отмечено. Поставьте бегунок в его конец и нажмите «Конец куска»."
-        elif self._sel():
-            hint = "Кусок выделен (жёлтый) — нажмите «Вырезать». Края можно подвинуть мышью."
+        elif sel:
+            hint = (f"Выделено {fmt_t(sel[1] - sel[0])} — нажмите «Вырезать» на шкале (или Delete). "
+                    "Края выделения можно подвинуть, Esc — снять выделение.")
         elif self.cuts:
-            hint = "Красное не попадёт в видео — нажмите ✕ на куске, чтобы вернуть его."
+            hint = ("Красные куски не попадут в видео (при просмотре они пропускаются). Вернуть кусок — ✕ на нём "
+                    "или в списке. Когда готово — «Сохранить видео» внизу.")
         else:
-            hint = ("Тяните белые ручки на шкале, чтобы обрезать начало и конец. Лишний кусок: бегунок в его "
-                    "начало → «Начало куска», в конец → «Конец куска» → «Вырезать».")
+            hint = ("Вырезать кусок: протяните мышью по кадрам на шкале → «Вырезать». "
+                    "Обрезать начало или конец: потяните белые ручки по краям шкалы.")
         self.help.configure(text=hint)
+        self._render_chips()
         self.tl.redraw()
 
     # --- просмотр
@@ -841,6 +894,8 @@ class EditorPanel(tk.Frame):
             self.step((-1 if k == "Left" else 1) * (0.1 if e.state & 0x1 else 1.0))
         elif k in ("Delete", "BackSpace"):
             self.cut()
+        elif k == "Escape":
+            self.clear_sel()
         else:
             return None
         return "break"

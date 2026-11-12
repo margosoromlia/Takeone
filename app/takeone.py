@@ -26,7 +26,7 @@ import ui_kit as ui
 from ui_kit import C
 
 APP = "Takeone"
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -579,7 +579,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(f"{APP} {VERSION}")
-        root.resizable(False, False)
+        root.resizable(True, True)  # можно растянуть или развернуть на весь экран
+        root.minsize(560, 600)
         root.configure(bg=C["bg"])
         self.engine = None
         self.state = "idle"  # idle | connected | recording | paused
@@ -621,6 +622,7 @@ class App:
         root.bind("<KeyPress>", lambda e: self.editor.key(e) if self.platform.get() == "Edit" else None)
 
         self._layout()
+        self._restore_geometry(cfg.get("geom"))
         self.update_buttons()
         self.refresh()
         self.tick()
@@ -630,7 +632,6 @@ class App:
         bg, W = C["bg"], self.W
         outer = self.outer = tk.Frame(self.root, bg=bg, padx=24)
         outer.pack(fill="both", expand=True)
-        tk.Frame(outer, bg=bg, width=W, height=0).pack()  # фиксирует ширину окна
 
         # шапка
         hd = tk.Frame(outer, bg=bg)
@@ -648,12 +649,17 @@ class App:
                                  self.platform, self._platform_changed)
         self.tabs.pack(fill="x")
 
+        # середина окна: прокручивается, если не влезает; низ (кнопки) закреплён
+        self.mid = tk.Frame(outer, bg=bg)
+        self.scroll = ui.ScrollArea(self.mid, bg=bg)
+        sc = self.scroll.body
+
         # монтаж: обрезка и вырезание кусков
         import editor
-        self.editor = editor.EditorPanel(outer, self, W)
+        self.editor = editor.EditorPanel(self.mid, self, W, foot_parent=outer)
 
         # список устройств
-        self.dev_sec = sec = tk.Frame(outer, bg=bg)
+        self.dev_sec = sec = tk.Frame(sc, bg=bg)
         head = tk.Frame(sec, bg=bg)
         head.pack(fill="x")
         self.dev_title = ui.label(head, "Телефоны", 15, weight="semibold")
@@ -663,11 +669,11 @@ class App:
         self.btn_refresh.pack(side="right")
         self.dev_card = ui.Card(sec, pad=6)
         self.dev_card.pack(fill="x", pady=(10, 0))
-        self.dev_hint = ui.label(sec, "", 12, C["text2"], wraplength=W, justify="left")
+        self.dev_hint = ui.autowrap(ui.label(sec, "", 12, C["text2"], wraplength=W, justify="left"), pad=12)
         self.dev_hint.pack(anchor="w", pady=(10, 0))
 
         # AirPlay: имя приёмника и шаги
-        self.ap_sec = sec = tk.Frame(outer, bg=bg)
+        self.ap_sec = sec = tk.Frame(sc, bg=bg)
         ui.label(sec, "Приёмник AirPlay", 15, weight="semibold").pack(anchor="w")
         card = ui.Card(sec, pad=16)
         card.pack(fill="x", pady=(10, 0))
@@ -675,13 +681,13 @@ class App:
         ui.label(b, "Имя приёмника на iPhone", 12, C["text2"]).pack(anchor="w")
         self.f_ap = ui.Field(b, self.ap_name, width=240)
         self.f_ap.pack(anchor="w", pady=(6, 0))
-        self.ap_steps = ui.label(b, "", 13, C["text2"], justify="left", wraplength=W - 40)
+        self.ap_steps = ui.autowrap(ui.label(b, "", 13, C["text2"], justify="left", wraplength=W - 40))
         self.ap_steps.pack(anchor="w", pady=(14, 0))
         self.ap_name.trace_add("write", lambda *a: self._ap_steps())
         self._ap_steps()
 
         # настройки
-        self.set_card = ui.Card(outer, pad=16)
+        self.set_card = ui.Card(sc, pad=16)
         sb = self.set_card.body
         ui.label(sb, "Настройки", 15, weight="semibold").pack(anchor="w")
         self.android_opts = ao = tk.Frame(sb, bg=C["panel"])
@@ -700,11 +706,12 @@ class App:
         self.tg_audio = ui.Toggle(row, self.audio)
         self.tg_audio.pack(side="right")
         lab = tk.Frame(row, bg=C["panel"])
-        lab.pack(side="left", fill="x")
+        lab.pack(side="left", fill="x", expand=True)
         t1 = ui.label(lab, "Звук телефона", 14, weight="semibold")
         t1.pack(anchor="w")
         t2 = ui.label(lab, "Android 11+. Пока включён, динамик телефона молчит", 12, C["muted"],
                       wraplength=W - 110, justify="left")
+        ui.autowrap(t2, ref=row, pad=64)
         t2.pack(anchor="w", pady=(2, 0))
         for w in (t1, t2, lab):
             w.bind("<ButtonRelease-1>", lambda e: self.tg_audio.toggle())
@@ -713,10 +720,11 @@ class App:
         self.tg_together = ui.Toggle(row, self.together, self._together_changed)
         self.tg_together.pack(side="right")
         lab = tk.Frame(row, bg=C["panel"])
-        lab.pack(side="left", fill="x")
+        lab.pack(side="left", fill="x", expand=True)
         t1 = ui.label(lab, "Общая запись телефонов", 14, weight="semibold")
         t1.pack(anchor="w")
         self.tg_together_sub = t2 = ui.label(lab, "", 12, C["muted"], wraplength=W - 110, justify="left")
+        ui.autowrap(t2, ref=row, pad=64)
         t2.pack(anchor="w", pady=(2, 0))
         for w in (t1, t2, lab):
             w.bind("<ButtonRelease-1>", lambda e: self.tg_together.toggle())
@@ -728,11 +736,12 @@ class App:
             self.tg_sharp = ui.Toggle(row, self.sharp, self.save_settings)
             self.tg_sharp.pack(side="right")
             lab = tk.Frame(row, bg=C["panel"])
-            lab.pack(side="left", fill="x")
+            lab.pack(side="left", fill="x", expand=True)
             t1 = ui.label(lab, "Чёткая картинка (Retina)", 14, weight="semibold")
             t1.pack(anchor="w")
             t2 = ui.label(lab, "Видео через видеочип Mac — резко и плавно. Для новых окон телефона", 12,
                           C["muted"], wraplength=W - 110, justify="left")
+            ui.autowrap(t2, ref=row, pad=64)
             t2.pack(anchor="w", pady=(2, 0))
             for w in (t1, t2, lab):
                 w.bind("<ButtonRelease-1>", lambda e: self.tg_sharp.toggle())
@@ -761,14 +770,20 @@ class App:
         self.b_pause.pack(side="left", padx=(4, 0))
         self.b_stop = ui.IconButton(rb, "stop", self.stop_rec, "Остановить и сохранить  (Ctrl+S)", bg=C["panel"])
         self.b_stop.pack(side="left", padx=(4, 0))
-        self.btn_disc = ui.Button(rb, "Отключить", self.toggle_connect, kind="secondary", height=32, radius=8,
+        self.btn_disc = ui.Button(rb, "Закрыть окна", self._recbar_right, kind="secondary", height=32, radius=8,
                                   size=13)
         self.btn_disc.pack(side="right", padx=(0, 2))
-        self.status_lbl = ui.label(ft, "", 12, C["muted"], wraplength=W, justify="center")
+        self.status_lbl = ui.autowrap(ui.label(ft, "", 12, C["muted"], wraplength=W, justify="center"))
         self.status.trace_add("write", lambda *a: self.status_lbl.configure(text=self._status_text()))
 
     def _status_text(self):
-        return self.status.get() or (ANDROID_NOTE if self.platform.get() == "Android" else IOS_NOTE)
+        if self.status.get():
+            return self.status.get()
+        if self.platform.get() != "Android":
+            return IOS_NOTE
+        if self.android_wins:
+            return "● Запись — здесь (для всех окон) или на панели окна телефона. Звук и скриншот — в окне телефона."
+        return "Сначала откройте трансляцию, потом нажмите «● Запись» — здесь или в окне телефона."
 
     def _num_field(self, grid, col, title, var, unit, padx):
         box = tk.Frame(grid, bg=C["panel"])
@@ -790,19 +805,25 @@ class App:
     def _layout(self):
         """Порядок блоков зависит от режима: Android, iPhone по кабелю или по Wi-Fi."""
         plat = self.platform.get()
-        for w in (self.dev_sec, self.ap_sec, self.set_card, self.footer, self.editor):
+        for w in (self.dev_sec, self.ap_sec, self.set_card, self.footer, self.editor, self.editor.foot,
+                  self.scroll, self.mid):
             w.pack_forget()
         if plat == "Edit":
-            self.editor.pack(fill="x", pady=(20, 22))
+            self.editor.foot.pack(side="bottom", fill="x", pady=(12, 18))
+            self.mid.pack(fill="both", expand=True, pady=(16, 0))
+            self.editor.pack(fill="both", expand=True)
             return
-        (self.ap_sec if plat == "AirPlay" else self.dev_sec).pack(fill="x", pady=(20, 0))
+        self.footer.pack(side="bottom", fill="x", pady=(12, 18))
+        self.mid.pack(fill="both", expand=True, pady=(16, 0))
+        self.scroll.pack(fill="both", expand=True)
+        (self.ap_sec if plat == "AirPlay" else self.dev_sec).pack(fill="x", pady=(4, 0))
         self.dev_title.configure(text="Телефоны" if plat == "Android" else "iPhone и iPad")
-        self.set_card.pack(fill="x", pady=(20, 0))
+        self.set_card.pack(fill="x", pady=(20, 4))
         if plat == "Android":
             self.android_opts.pack(fill="x", before=self.limit_row)
         else:
             self.android_opts.pack_forget()
-        self.footer.pack(fill="x", pady=(20, 22))
+        self.scroll.to_top()
 
     def _platform_changed(self):
         if self.platform.get() != "Edit":
@@ -903,6 +924,14 @@ class App:
         self.update_buttons()
 
     def _pill_click(self):
+        if self.platform.get() == "Android":
+            if any(g.state == "paused" for g in self._groups()):
+                for g in self._groups():
+                    if g.state == "paused":
+                        g.toggle_pause()
+            else:
+                self.start_rec()
+            return
         if self.state == "paused":
             self.toggle_pause()
         else:
@@ -997,7 +1026,15 @@ class App:
         # низ окна
         for w in (self.btn_main, self.recbar, self.status_lbl):
             w.pack_forget()
-        if android or s == "idle":
+        if android and live:  # окна телефонов открыты — запись можно вести отсюда
+            self.recbar.pack(fill="x")
+            self._update_recbar()
+            n = len(sel)
+            if n:
+                self.btn_main.set(text=f"Добавить {n} {ui.plural(n, 'трансляцию', 'трансляции', 'трансляций')}",
+                                  enabled=not rec and not b)
+                self.btn_main.pack(fill="x", pady=(8, 0))
+        elif android or s == "idle":
             n = len(sel)
             if android:
                 verb = "Добавить" if live else "Открыть"
@@ -1015,6 +1052,10 @@ class App:
         self.status_lbl.pack(fill="x", pady=(10, 0))
 
     def _update_recbar(self):
+        if self.platform.get() == "Android" and self.android_wins:
+            self._update_android_bar()
+            return
+        self.btn_disc.set(text="Отключить")
         s, b = self.state, self.busy
         total = self.elapsed + (time.monotonic() - self.seg_started if self.seg_started else 0)
         if self.saving:
@@ -1030,6 +1071,35 @@ class App:
                          "Продолжить  (Ctrl+P)" if s == "paused" else "Пауза  (Ctrl+P)")
         self.b_stop.set(enabled=active and not b, tone="raised" if active else "")
         self.btn_disc.set(enabled=s == "connected" and not b)
+
+    def _update_android_bar(self):
+        """Панель записи в главном окне, когда открыты окна Android-телефонов (управляет всеми)."""
+        groups = self._groups()
+        st = [g.state for g in groups]
+        t = max((g.time() for g in groups), default=0.0)
+        n = len(self.android_wins)
+        if "saving" in st:
+            self.pill.set("saving", "Сохранение", enabled=False, spin=int(time.monotonic() * 12) % 12 * 30)
+        elif "recording" in st:
+            self.pill.set("recording", ui.fmt_hms(t), blink=int(time.monotonic() * 2) % 2 == 0)
+        elif "paused" in st:
+            self.pill.set("paused", ui.fmt_hms(t))
+        else:
+            ready = any(g.ready() for g in groups)
+            self.pill.set("idle", f"Запись ×{n}" if n > 1 and self.together.get() else "Запись", enabled=ready)
+        active = any(x in ("recording", "paused") for x in st)
+        self.b_pause.set("play" if ("paused" in st and "recording" not in st) else "pause", active,
+                         "Продолжить  (Ctrl+P)" if "paused" in st else "Пауза  (Ctrl+P)")
+        self.b_stop.set(enabled=active, tone="raised" if active else "")
+        self.btn_disc.set(text="Закрыть окна", enabled=not active and "saving" not in st)
+
+    def _recbar_right(self):
+        if self.platform.get() == "Android" and self.android_wins:
+            if not self._rec_active():
+                for w in list(self.android_wins):
+                    w.close()
+            return
+        self.toggle_connect()
 
     # --- устройства
     def refresh(self):
@@ -1109,8 +1179,30 @@ class App:
         except ValueError:
             return 0.0
 
+    def _restore_geometry(self, geom):
+        """Размер окна — как в прошлый раз (но не больше экрана); иначе — по высоте экрана."""
+        r = self.root
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        w, h, x, y = 560, min(860, sh - 90), None, None
+        m = re.match(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", geom or "")
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            x, y = int(m.group(3)), int(m.group(4))
+        w, h = max(560, min(w, sw)), max(600, min(h, sh - 60))
+        if x is None or not (0 <= x <= sw - 120 and 0 <= y <= sh - 120):
+            x, y = max(0, (sw - w) // 2), max(0, min(40, sh - h - 60))
+        r.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _geometry(self):
+        try:
+            if self.root.state() == "zoomed" or self.root.attributes("-fullscreen"):
+                return None
+        except tk.TclError:
+            pass
+        return self.root.geometry()
+
     def save_settings(self):
-        save_settings({"platform": self.platform.get(), "max_size": self.max_size.get(),
+        save_settings({"geom": self._geometry() or load_settings().get("geom"), "platform": self.platform.get(), "max_size": self.max_size.get(),
                        "bitrate": self.bitrate.get(), "audio": self.audio.get(),
                        "ap_name": self.ap_name.get(), "limit_mb": self.limit_mb.get(),
                        "win_size": self.win_size.get(), "together": self.together.get(),
@@ -1350,7 +1442,8 @@ class App:
 
     # --- таймер и контроль процессов
     def tick(self):
-        if self.state in ("connected", "recording", "paused"):
+        if self.state in ("connected", "recording", "paused") or (
+                self.android_wins and self.platform.get() == "Android"):
             self._update_recbar()
         groups = self._groups()
         gs = tuple(g.state for g in groups)

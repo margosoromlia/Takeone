@@ -311,6 +311,113 @@ def label(parent, text="", size=13, color=None, weight="normal", mono=False, bg=
                     font=font(size, weight, mono), bd=0, padx=0, pady=0, **kw)
 
 
+def autowrap(lbl, ref=None, pad=0):
+    """Перенос строк по ширине ref (по умолчанию — родителя): текст подстраивается под размер окна."""
+    ref = ref or lbl.master
+
+    def f(e):
+        w = max(80, e.width - pad)
+        if int(float(lbl.cget("wraplength") or 0)) != w:
+            lbl.configure(wraplength=w)
+    ref.bind("<Configure>", f, add="+")
+    return lbl
+
+
+def _wheel_units(e):
+    if getattr(e, "num", None) == 4:
+        return -1
+    if getattr(e, "num", None) == 5:
+        return 1
+    d = e.delta
+    if IS_MAC:
+        return -d if abs(d) < 40 else -int(d / 40)
+    return -int(d / 120) or (-1 if d > 0 else 1)
+
+
+class ScrollArea(tk.Frame):
+    """Прокручиваемая область: содержимое в .body; тонкая полоса справа появляется, когда не влезает."""
+
+    def __init__(self, parent, bg=None):
+        bg = bg or bg_of(parent)
+        super().__init__(parent, bg=bg)
+        self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, width=10, height=10, yscrollincrement=24)
+        self.bar = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, width=10)
+        self.bar.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.cv, bg=bg)
+        self.win = self.cv.create_window(0, 0, anchor="nw", window=self.body)
+        self.body.bind("<Configure>", lambda e: self._sync())
+        self.cv.bind("<Configure>", self._cv_conf)
+        self.cv.configure(yscrollcommand=lambda a, b: self._draw_bar())
+        self.bar.bind("<ButtonPress-1>", self._bar_press)
+        self.bar.bind("<B1-Motion>", self._bar_drag)
+        for w in (self, self.cv, self.body):
+            w.bind("<Enter>", lambda e: self._wheel(True), add="+")
+            w.bind("<Leave>", lambda e: self._leave(e), add="+")
+        self._grab = None
+
+    def _cv_conf(self, e):
+        self.cv.itemconfigure(self.win, width=e.width)
+        self._sync()
+
+    def _sync(self):
+        h = self.body.winfo_reqheight()
+        self.cv.configure(scrollregion=(0, 0, self.cv.winfo_width(), h))
+        if h <= self.cv.winfo_height():
+            self.cv.yview_moveto(0)
+        self._draw_bar()
+
+    def overflow(self):
+        return self.body.winfo_reqheight() > self.cv.winfo_height() + 1
+
+    def _draw_bar(self):
+        b = self.bar
+        b.delete("all")
+        if not self.overflow():
+            return
+        h = b.winfo_height()
+        a, z = self.cv.yview()
+        y0, y1 = a * h, max(a * h + 24, z * h)
+        paint(b, 10, h, box(3, y0 + 2, 9, y1 - 2, 3, C["hover"]), tag="thumb")
+
+    def _bar_press(self, e):
+        a, z = self.cv.yview()
+        h = max(1, self.bar.winfo_height())
+        if not (a * h <= e.y <= z * h):
+            self.cv.yview_moveto(max(0.0, e.y / h - (z - a) / 2))
+        self._grab = (e.y, self.cv.yview()[0])
+
+    def _bar_drag(self, e):
+        if self._grab:
+            y, a = self._grab
+            self.cv.yview_moveto(a + (e.y - y) / max(1, self.bar.winfo_height()))
+
+    def _on_wheel(self, e):
+        if self.overflow():
+            self.cv.yview_scroll(_wheel_units(e), "units")
+
+    def _wheel(self, on):
+        root = self.winfo_toplevel()
+        if on:
+            root.bind_all("<MouseWheel>", self._on_wheel)
+            root.bind_all("<Button-4>", self._on_wheel)
+            root.bind_all("<Button-5>", self._on_wheel)
+        else:
+            for s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                root.unbind_all(s)
+
+    def _leave(self, e):
+        x, y = self.winfo_pointerxy()
+        w = self.winfo_containing(x, y)
+        while w is not None and w is not self:
+            w = w.master
+        if w is None:
+            self._wheel(False)
+
+    def to_top(self):
+        self.cv.yview_moveto(0)
+
+
 class Tooltip:
     def __init__(self, widget, text_fn):
         self.w, self.text_fn = widget, text_fn
