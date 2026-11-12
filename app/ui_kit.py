@@ -132,6 +132,9 @@ ICONS = {
               ("circle", 12, 16.8, 1.15, None)],
     "close": [("line", [(6.5, 6.5), (17.5, 17.5)], 2), ("line", [(17.5, 6.5), (6.5, 17.5)], 2)],
     "check": [("line", [(5, 12.5), (9.5, 17), (19, 7)], 2.6)],
+    "trash": [("line", [(4, 7), (20, 7)], 2), ("line", [(9.5, 7), (9.5, 4), (14.5, 4), (14.5, 7)], 2),
+              ("line", [(6.5, 7), (7.5, 20), (16.5, 20), (17.5, 7)], 2), ("line", [(10.3, 11), (10.3, 16.5)], 1.8),
+              ("line", [(13.7, 11), (13.7, 16.5)], 1.8)],
     "scissors": [("circle", 6.5, 6.5, 3, 2), ("circle", 6.5, 17.5, 3, 2), ("line", [(9, 8.3), (20, 17)], 2),
                  ("line", [(9, 15.7), (20, 7)], 2)],
     "folder": [("line", [(3, 7), (3, 18.5), (21, 18.5), (21, 8.5), (12, 8.5), (10, 5.5), (3, 5.5), (3, 7)], 2)],
@@ -674,7 +677,7 @@ class Segmented(_Canvas):
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Motion>", self._motion)
         self.bind("<Leave>", lambda e: self._hover(None))
-        self.bind("<ButtonRelease-1>", self._click)
+        self.bind("<ButtonPress-1>", self._click)  # переключаем сразу по нажатию
         Tooltip(self, lambda: self.tips.get(self.hover, ""))
         self._draw()
 
@@ -731,6 +734,8 @@ class Segmented(_Canvas):
         for (x0, x1), (val, _) in zip(segs, self.options):
             if val == cur:
                 shapes += box(x0, pad, x1, h - pad, self.r - 2, C["hover"] if self.enabled else C["elev"])
+            elif val == self.hover and self.enabled and val not in self.disabled:
+                shapes += box(x0, pad, x1, h - pad, self.r - 2, C["row_hover"])  # подсветка под мышью
         paint(self, w, h, shapes)
         self.delete("txt")
         for (x0, x1), (val, text) in zip(segs, self.options):

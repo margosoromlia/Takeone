@@ -189,11 +189,18 @@ class SaveDialog(tk.Toplevel):
             self._cancel()
 
 
+OPEN = [0]  # сколько окон сохранения сейчас открыто (чтобы следующее подождало)
+
+
 def ask(parent, app_name, name, **kw):
     """Показать окно и дождаться ответа: ("save", путь) | ("delete", None) | ("cancel", None)."""
-    d = SaveDialog(parent, app_name, name, **kw)
-    d.wait_window()
-    return d.result
+    OPEN[0] += 1
+    try:
+        d = SaveDialog(parent, app_name, name, **kw)
+        d.wait_window()
+        return d.result
+    finally:
+        OPEN[0] -= 1
 
 
 def unique_name(folder, name, ext):

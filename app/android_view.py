@@ -1062,6 +1062,12 @@ class RecordGroup:
         self.tmp = None
         self.layout = WindowLayout()  # раскладка по умолчанию, если окну не дали общую
         self.multi_rec = False
+        # iPhone/iPad (по кабелю или Wi-Fi) в общей записи: у них свои окна, а запись — через этот объект.
+        # Интерфейс: ready(), ext_start(), ext_pause(), ext_resume(), ext_finish(tmp) -> (путь, (w, h)), ext_cleanup()
+        self.extras = []
+        self.rec_extras = []
+        self.dialog_parent = None   # главное окно — для диалогов, когда окон Android нет
+        self.on_done = None         # сообщить главному окну: (текст, папка)
 
     @property
     def multi(self):
@@ -1091,7 +1097,8 @@ class RecordGroup:
 
     def ready(self):
         alive = self.alive()
-        return bool(alive) and all(w.ready() for w in alive)
+        xs = [x for x in self.extras if x.ready()]
+        return (bool(alive) or bool(xs)) and all(w.ready() for w in alive)
 
     # --- кнопки
     def start(self):
@@ -1099,13 +1106,16 @@ class RecordGroup:
             return
         self.tmp = tempfile.mkdtemp(prefix="takeone_rec_", dir=self.tmp_root)
         rec_members = self.alive()
-        self.multi_rec = len(rec_members) > 1
+        self.rec_extras = [x for x in self.extras if x.ready()]
+        self.multi_rec = len(rec_members) + len(self.rec_extras) > 1
         self.timeline = Timeline() if self.multi_rec else None
         for i, w in enumerate(rec_members):
             asc = None if self.multi_rec else w.aconf  # общая запись — без звука
             w.recorder = Recorder(os.path.join(self.tmp, f"dev{i}.mkv"), w.dev_size, asc, self.timeline)
             w.recorder.start()
             w.link.reset_video()  # телефон сразу присылает ключевой кадр
+        for x in self.rec_extras:
+            x.ext_start()
         self.state, self.elapsed, self.since = "recording", 0.0, time.monotonic()
         self.refresh()
         self.toast("Общая запись началась" if self.multi_rec else "Запись началась")
@@ -1117,11 +1127,13 @@ class RecordGroup:
             for w in self.members:
                 if w.recorder:
                     w.recorder.pause()
+            for x in self.rec_extras:
+                x.ext_pause()
             self.elapsed += time.monotonic() - self.since
             self.since, self.state = None, "paused"
             self.toast("Пауза — эта часть не попадёт в видео")
         elif self.state == "paused":
-            if not any(w.recorder and w.ended is None for w in self.members):
+            if not any(w.recorder and w.ended is None for w in self.members) and not self.rec_extras:
                 return
             if self.timeline:
                 self.timeline.resume()
@@ -1129,6 +1141,8 @@ class RecordGroup:
                 if w.recorder:
                     w.recorder.resume()
                     w.link.reset_video()
+            for x in self.rec_extras:
+                x.ext_resume()
             self.state, self.since = "recording", time.monotonic()
             self.toast("Запись продолжается")
         self.refresh()
@@ -1147,6 +1161,9 @@ class RecordGroup:
     def discard(self):
         if self.state in ("recording", "paused"):
             self._collect()
+            for x in self.rec_extras:
+                x.ext_cleanup()
+            self.rec_extras = []
             shutil.rmtree(self.tmp, ignore_errors=True)
             self._done("Запись удалена")
 
@@ -1156,32 +1173,38 @@ class RecordGroup:
                 then()
             return
         files = self._collect()
+        extras, self.rec_extras = self.rec_extras, []
         duration = self.elapsed
         self.state = "saving"
         self.refresh()
-        parent = parent or (self.members[0] if self.members else None)
-        if not files:
+        parent = parent or (self.members[0] if self.members else self.dialog_parent)
+        n_src = len(files) + len(extras)
+        if not n_src:
             shutil.rmtree(self.tmp, ignore_errors=True)
             self._done("Запись пустая — нечего сохранять")
             return then and then()
+
+        def drop_extras():
+            for x in extras:
+                x.ext_cleanup()
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if self.multi_rec:
             name = f"{self.app_name}_вместе_{stamp}"
         else:
-            ln = self.members[0].link if self.members else None
-            model = ((ln.props.get("model") or ln.device_name) if ln else "") or ""
+            ln = self.members[0].link if (self.members and files) else None
+            model = ((ln.props.get("model") or ln.device_name) if ln else (extras[0].label if extras else "")) or ""
             model = "".join(ch if ch.isalnum() or ch in "-" else "_" for ch in model).strip("_")[:30]
             name = f"{self.app_name}_{model + '_' if model else ''}{stamp}"
         import save_dialog
         folder = save_dialog.last_dir(self.video_dir)
         ext = save_dialog.load_prefs().get("ext_android", "mp4")
-        who = (f"{len(files)} {plural(len(files), 'телефон', 'телефона', 'телефонов')} вместе, без звука"
-               if self.multi_rec else (self.members[0].link.props.get("model") or self.members[0].link.device_name
-                                       if self.members else ""))
+        who = (f"{n_src} {plural(n_src, 'устройство', 'устройства', 'устройств')} вместе, без звука"
+               if self.multi_rec else (model or ""))
         res, dest = save_dialog.ask(parent, self.app_name, save_dialog.unique_name(folder, name, ext),
                                     kind="android", folder=folder,
                                     info=" · ".join(v for v in (f"Длительность {fmt_hms(duration)}", who) if v))
         if res != "save":
+            threading.Thread(target=drop_extras, daemon=True).start()
             shutil.rmtree(self.tmp, ignore_errors=True)
             self._done("Запись удалена")
             return then and then()
@@ -1190,7 +1213,7 @@ class RecordGroup:
         fname = os.path.basename(dest)
         if multi:
             title = "Склеиваю видео" + (f" · до {fmt_mb(limit)} МБ" if limit else "")
-            note = f"{len(files)} {plural(len(files), 'экран', 'экрана', 'экранов')} рядом, без звука. " \
+            note = f"{n_src} {plural(n_src, 'экран', 'экрана', 'экранов')} рядом, без звука. " \
                    "Трансляция продолжается."
         else:
             title, note = "Сохраняю видео", "Трансляция продолжается."
@@ -1213,14 +1236,27 @@ class RecordGroup:
             try:
                 if not self.ffmpeg:
                     raise RuntimeError("не найден ffmpeg")
-                if multi:
-                    save_combined(self.ffmpeg, [p for p, _ in files], [s for _, s in files], dest,
+                allf = list(files)
+                for x in extras:  # iPhone/iPad: остановить запись и получить файл
+                    try:
+                        r = x.ext_finish(tmp)
+                    except Exception as e:  # noqa
+                        r = None
+                        x.ext_error = str(e)
+                    if r:
+                        allf.append(r)
+                if not allf:
+                    raise RuntimeError("не получилось забрать видео с устройств")
+                if len(allf) > 1:
+                    save_combined(self.ffmpeg, [p for p, _ in allf], [s for _, s in allf], dest,
                                   duration, limit, progress, tmp)
                 else:
-                    save_single(self.ffmpeg, files[0][0], dest, limit, progress, tmp)
+                    save_single(self.ffmpeg, allf[0][0], dest, limit, progress, tmp)
                 shutil.rmtree(tmp, ignore_errors=True)
             except Exception as e:  # noqa
                 err = f"{e}\n\nИсходные записи остались здесь:\n{tmp}"
+            finally:
+                drop_extras()
             anchor.after(0, lambda: finish(err))
 
         def finish(err):
@@ -1245,6 +1281,8 @@ class RecordGroup:
         self.save_card(None)
         self.refresh()
         self.toast(msg, folder)
+        if self.on_done:
+            self.on_done(msg, folder)
 
     def member_ended(self, w):
         if self.state in ("recording", "paused"):
@@ -1428,7 +1466,8 @@ class DeviceWindow(tk.Toplevel):
         s = g.state
         alive = self.ended is None
         t = fmt_hms(g.time())
-        both = f" ×{sum(1 for m in g.members if m.recorder)}" if g.multi_rec and s in ("recording", "paused") else ""
+        both = (f" ×{sum(1 for m in g.members if m.recorder) + len(g.rec_extras)}"
+                if g.multi_rec and s in ("recording", "paused") else "")
         if s == "recording":
             self.pill.set("recording", t + both, blink=int(time.monotonic() * 2) % 2 == 0)
         elif s == "paused":
@@ -1436,7 +1475,7 @@ class DeviceWindow(tk.Toplevel):
         elif s == "saving":
             self.pill.set("saving", "Сохранение", enabled=False, spin=int(time.monotonic() * 12) % 12 * 30)
         else:
-            n = len(g.alive())
+            n = len(g.alive()) + len([x for x in g.extras if x.ready()])  # вместе с iPhone/iPad
             self.pill.set("idle", f"Запись ×{n}" if n > 1 else "Запись", enabled=alive and g.ready())
         active = s in ("recording", "paused")
         self.b_pause.set("play" if s == "paused" else "pause", active,
